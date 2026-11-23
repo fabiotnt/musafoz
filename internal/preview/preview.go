@@ -14,13 +14,15 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/fabiotnt/musafoz/internal/fslock"
 	"github.com/fabiotnt/musafoz/internal/media"
 )
 
-// Frame count limits. The mosaic grid is fixed at 10 by 10.
+// Frame count limits. The mosaic grid follows the frame count, up to 10 by
+// 10; see media.MosaicGrid.
 const (
 	DefaultFrames = 100
 	MaxFrames     = 100
@@ -113,7 +115,8 @@ type Options struct {
 	Frames           int
 	Overwrite        bool
 	FaststartInPlace bool
-	// Font is an explicit overlay font. Empty means media.DefaultFonts.
+	// Font is an explicit overlay font file. Empty means the embedded
+	// DejaVu Sans Mono.
 	Font string
 	// Accel selects hardware acceleration. Empty means media.AccelAuto.
 	Accel media.Accel
@@ -130,7 +133,14 @@ type Options struct {
 	// may be nil.
 	Logf  func(format string, args ...any)
 	Warnf func(format string, args ...any)
+	// Progress shows progress for steps that run without log output. It
+	// may be nil.
+	Progress Progress
 
+	// CoverAt is the cover timestamp in seconds. It must be between zero
+	// and the start of the last video frame. Nil picks a random timestamp
+	// with media.CoverTime.
+	CoverAt *float64
 	// Random returns a number in [0, 1) for the cover choice. Nil uses
 	// math/rand/v2.
 	Random func() float64
@@ -144,8 +154,10 @@ type Result struct {
 	Outputs         Outputs `json:"outputs"`
 	DurationSeconds float64 `json:"duration_seconds"`
 	Frames          int     `json:"frames"`
-	CoverAtSeconds  float64 `json:"cover_at_seconds"`
-	Faststart       string  `json:"faststart"`
+	// CoverAtSeconds is the timestamp the cover was taken at, given or
+	// picked at random.
+	CoverAtSeconds float64 `json:"cover_at_seconds"`
+	Faststart      string  `json:"faststart"`
 	// FrameDecoder and PreviewEncoder name the backend that did the work,
 	// "cpu" or "videotoolbox", after any fallback.
 	FrameDecoder   string `json:"frame_decoder"`
@@ -159,11 +171,48 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	return r.do(ctx)
 }
 
+// Progress shows the progress of one step at a time.
+type Progress interface {
+	// Start begins a step. A positive total counts units of work, such as
+	// frames; zero only shows that the step is running.
+	Start(label string, total int64, unit string)
+	// Set reports the work done so far. It may be called from several
+	// goroutines.
+	Set(done int64)
+	// Done ends the step.
+	Done()
+}
+
 type run struct {
-	opts    Options
-	input   string
-	staging string
-	keep    bool
+	opts     Options
+	input    string
+	staging  string
+	keep     bool
+	progress bool
+}
+
+// startProgress begins a progress display; endProgress, also called by
+// fail, ends it.
+func (r *run) startProgress(label string, total int64, unit string) {
+	if r.opts.Progress == nil {
+		return
+	}
+	r.endProgress()
+	r.opts.Progress.Start(label, total, unit)
+	r.progress = true
+}
+
+func (r *run) setProgress(done int64) {
+	if r.opts.Progress != nil {
+		r.opts.Progress.Set(done)
+	}
+}
+
+func (r *run) endProgress() {
+	if r.progress {
+		r.opts.Progress.Done()
+		r.progress = false
+	}
 }
 
 func (r *run) logf(format string, args ...any) {
@@ -179,6 +228,7 @@ func (r *run) warnf(format string, args ...any) {
 }
 
 func (r *run) fail(step string, err error) error {
+	r.endProgress()
 	se := &StepError{Path: r.opts.Input, Step: step, Err: err}
 	if r.keep {
 		se.Kept = r.staging
@@ -192,6 +242,9 @@ func (r *run) do(ctx context.Context) (*Result, error) {
 	if o.Frames < 1 || o.Frames > MaxFrames {
 		return nil, r.fail(StepValidateOptions, fmt.Errorf("frames must be between 1 and %d, got %d", MaxFrames, o.Frames))
 	}
+	if c := o.CoverAt; c != nil && (*c < 0 || math.IsNaN(*c) || math.IsInf(*c, 0)) {
+		return nil, r.fail(StepValidateOptions, fmt.Errorf("cover time must be zero or more, got %v", *c))
+	}
 	abs, err := filepath.Abs(o.Input)
 	if err != nil {
 		return nil, r.fail(StepValidateInput, err)
@@ -204,6 +257,12 @@ func (r *run) do(ctx context.Context) (*Result, error) {
 		if _, err := media.FaststartMuxer(abs); err != nil {
 			return nil, r.fail(StepValidateOptions, err)
 		}
+	}
+	// The font is local, so a bad --font fails before FFprobe and FFmpeg are
+	// resolved or downloaded.
+	font, err := media.FindFont(o.Font)
+	if err != nil {
+		return nil, r.fail(StepFindFont, err)
 	}
 
 	// One lock per output set, held until publishing and any restore end.
@@ -253,6 +312,11 @@ func (r *run) do(ctx context.Context) (*Result, error) {
 		}
 	}
 	last := info.LastFrameTime()
+	if c := o.CoverAt; c != nil && *c > last+1e-6 {
+		return nil, r.fail(StepValidateOptions, fmt.Errorf(
+			"cover time %s is outside the video: the last frame starts at %s (duration %s); use a time from 00:00:00 to %s",
+			media.Timestamp(*c), media.Timestamp(last), media.Timestamp(duration), media.Timestamp(math.Floor(last*1000)/1000)))
+	}
 	origStat, err := os.Stat(abs)
 	if err != nil {
 		return nil, r.fail(StepInspect, err)
@@ -264,10 +328,6 @@ func (r *run) do(ctx context.Context) (*Result, error) {
 	}
 	if err := media.CheckFFmpegFeatures(ctx, ffmpeg); err != nil {
 		return nil, r.fail(StepResolveFFmpeg, err)
-	}
-	font, err := media.FindFont(o.Font)
-	if err != nil {
-		return nil, r.fail(StepFindFont, err)
 	}
 
 	r.staging, err = os.MkdirTemp(dir, "."+base+".musafoz-")
@@ -284,8 +344,9 @@ func (r *run) do(ctx context.Context) (*Result, error) {
 		return nil, r.fail(StepPrepare, err)
 	}
 	defer os.RemoveAll(work)
-	fontLink := filepath.Join(work, "font"+strings.ToLower(filepath.Ext(font)))
-	if err := os.Symlink(font, fontLink); err != nil {
+	r.logf("overlay font: %s", font)
+	fontCopy, err := font.WriteCopy(work)
+	if err != nil {
 		return nil, r.fail(StepPrepare, err)
 	}
 	header := filepath.Join(work, "header.txt")
@@ -329,13 +390,15 @@ func (r *run) do(ctx context.Context) (*Result, error) {
 		platform = runtime.GOOS
 	}
 
+	r.startProgress("choosing the frame decoder", 0, "")
 	dec := media.ChooseDecode(ctx, ffmpeg, source, info, mode, platform)
+	r.endProgress()
 	if ctx.Err() != nil {
 		return nil, r.fail(StepExtractFrames, ctx.Err())
 	}
 	r.logf("frame decoding: %s (%s)", media.BackendLabel(dec.Backend), dec.Reason)
 	frameOpts := media.FrameOptions{
-		FFmpeg: ffmpeg, Input: source, WorkDir: work, FontFile: fontLink,
+		FFmpeg: ffmpeg, Input: source, WorkDir: work, FontFile: fontCopy,
 		Times:       media.FrameTimes(duration, o.Frames, last),
 		Overlay:     media.OverlayFor(info.Video.DisplayWidth, info.Video.DisplayAspect()),
 		Concurrency: o.Concurrency,
@@ -344,6 +407,10 @@ func (r *run) do(ctx context.Context) (*Result, error) {
 		frameOpts.Decode = d
 		r.logf("extracting %d frames on %s (%d parallel ffmpeg processes)",
 			o.Frames, media.BackendLabel(d.Backend), min(d.Workers(o.Concurrency), o.Frames))
+		var done atomic.Int64
+		frameOpts.OnFrame = func() { r.setProgress(done.Add(1)) }
+		r.startProgress("extracting frames", int64(o.Frames), "frames")
+		defer r.endProgress()
 		return media.ExtractFrames(ctx, frameOpts)
 	}
 	stepStart := time.Now()
@@ -359,40 +426,56 @@ func (r *run) do(ctx context.Context) (*Result, error) {
 	res.FrameDecoder = dec.Backend
 	r.logf("extracted %d frames on %s in %.1f s", o.Frames, media.BackendLabel(dec.Backend), time.Since(stepStart).Seconds())
 
-	random := o.Random
-	if random == nil {
-		random = rand.Float64
+	if o.CoverAt != nil {
+		res.CoverAtSeconds = *o.CoverAt
+		r.logf("generating cover at %s (--cover-at) on CPU", media.Timestamp(res.CoverAtSeconds))
+	} else {
+		random := o.Random
+		if random == nil {
+			random = rand.Float64
+		}
+		res.CoverAtSeconds = media.CoverTime(duration, last, random)
+		r.logf("generating cover at %s (random) on CPU", media.Timestamp(res.CoverAtSeconds))
 	}
-	res.CoverAtSeconds = media.CoverTime(duration, last, random)
-	r.logf("generating cover at %s on CPU", media.Clock(res.CoverAtSeconds))
+	r.startProgress("generating cover", 0, "")
 	if err := media.ExtractCover(ctx, ffmpeg, source, res.CoverAtSeconds, staged.Cover); err != nil {
 		return nil, r.fail(StepCover, err)
 	}
+	r.startProgress("choosing the preview encoder", 0, "")
 	enc := media.ChooseEncode(ctx, ffmpeg, mode, platform,
 		info.Video.DisplayWidth, info.Video.DisplayHeight)
+	r.endProgress()
 	if ctx.Err() != nil {
 		return nil, r.fail(StepPreviewVideo, ctx.Err())
 	}
 	r.logf("preview encoding: %s with %s (%s)", media.BackendLabel(enc.Backend), enc.Encoder(), enc.Reason)
 	stepStart = time.Now()
-	err = media.EncodePreview(ctx, ffmpeg, work, staged.Video, enc)
+	encode := func(e media.EncodePath) error {
+		r.startProgress("encoding preview video", int64(o.Frames), "frames")
+		defer r.endProgress()
+		return media.EncodePreview(ctx, ffmpeg, work, staged.Video, e, r.setProgress)
+	}
+	err = encode(enc)
 	if err != nil && enc.Backend != media.BackendCPU && ctx.Err() == nil {
 		r.logf("preview encoding with %s failed (%v); retrying once with libx264", enc.Encoder(), err)
 		enc = media.CPUEncode("fallback after a hardware failure")
-		err = media.EncodePreview(ctx, ffmpeg, work, staged.Video, enc)
+		err = encode(enc)
 	}
 	if err != nil {
 		return nil, r.fail(StepPreviewVideo, err)
 	}
 	res.PreviewEncoder = enc.Backend
 	r.logf("encoded preview video with %s in %.1f s", enc.Encoder(), time.Since(stepStart).Seconds())
-	r.logf("building mosaic")
+	layout := media.MosaicLayoutFor(info.Video.DisplayAspect(), o.Frames)
+	r.logf("building mosaic: %dx%d grid of %dx%d cells", layout.Cols, layout.Rows, layout.CellW, layout.CellH)
+	r.startProgress("building mosaic", 0, "")
 	if err := media.BuildMosaic(ctx, media.MosaicOptions{
-		FFmpeg: ffmpeg, WorkDir: work, FontFile: fontLink, HeaderFile: header, Out: staged.Mosaic,
-		Aspect: info.Video.DisplayAspect(),
+		FFmpeg: ffmpeg, WorkDir: work, FontFile: fontCopy, HeaderFile: header, Out: staged.Mosaic,
+		Aspect: info.Video.DisplayAspect(), Frames: o.Frames,
 	}); err != nil {
 		return nil, r.fail(StepMosaic, err)
 	}
+	r.endProgress()
 
 	// Publish the three outputs, then replace the original if requested.
 	// Any failure restores the earlier set.
@@ -454,7 +537,14 @@ func (e *UnsupportedTracksError) Error() string {
 // timestamps; stream copy keeps packets unchanged and the original video
 // timescale is passed to the muxer.
 func (r *run) remux(ctx context.Context, ffprobe, ffmpeg string, orig *media.Info, dst string) error {
-	if err := media.Remux(ctx, ffmpeg, r.input, dst, orig.Video.Timescale()); err != nil {
+	var total int64
+	if orig.DurationSeconds != nil {
+		total = int64(math.Round(*orig.DurationSeconds * 1000))
+	}
+	r.startProgress("remuxing", total, "ms")
+	err := media.Remux(ctx, ffmpeg, r.input, dst, orig.Video.Timescale(), func(us int64) { r.setProgress(us / 1000) })
+	r.endProgress()
+	if err != nil {
 		return err
 	}
 	info, err := media.Inspect(ctx, ffprobe, dst)

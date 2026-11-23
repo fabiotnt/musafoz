@@ -1,21 +1,80 @@
 package media
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os/exec"
+	"strconv"
 	"strings"
 )
+
+// progressInt calls report with the integer value of key, ignoring other
+// keys and values ffmpeg reports as N/A.
+func progressInt(key string, report func(int64)) func(string, string) {
+	if report == nil {
+		return nil
+	}
+	return func(k, v string) {
+		if k != key {
+			return
+		}
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			report(n)
+		}
+	}
+}
 
 // runFFmpeg runs ffmpeg quietly. On failure the error carries the last
 // meaningful line ffmpeg printed.
 func runFFmpeg(ctx context.Context, ffmpeg string, args ...string) error {
-	full := append([]string{"-hide_banner", "-nostdin", "-loglevel", "error", "-y"}, args...)
+	return runFFmpegIn(ctx, "", ffmpeg, args...)
+}
+
+// runFFmpegIn runs ffmpeg with dir as its current directory, so that
+// filters can name files in dir without their full path.
+func runFFmpegIn(ctx context.Context, dir, ffmpeg string, args ...string) error {
+	return runFFmpegProgress(ctx, dir, ffmpeg, nil, args...)
+}
+
+// runFFmpegProgress runs ffmpeg like runFFmpegIn. When onProgress is set,
+// ffmpeg writes its machine-readable progress report ("-progress pipe:1")
+// to standard output, and onProgress receives each key and value, such as
+// frame=42 or out_time_us=1500000.
+func runFFmpegProgress(ctx context.Context, dir, ffmpeg string, onProgress func(key, value string), args ...string) error {
+	full := []string{"-hide_banner", "-nostdin", "-loglevel", "error", "-y"}
+	if onProgress != nil {
+		full = append(full, "-progress", "pipe:1", "-nostats")
+	}
+	full = append(full, args...)
 	var errOut bytes.Buffer
 	cmd := exec.CommandContext(ctx, ffmpeg, full...)
+	cmd.Dir = dir
 	cmd.Stderr = &errOut
-	if err := cmd.Run(); err != nil {
+	var stdout io.ReadCloser
+	if onProgress != nil {
+		var err error
+		if stdout, err = cmd.StdoutPipe(); err != nil {
+			return err
+		}
+	}
+	err := cmd.Start()
+	if err == nil {
+		if stdout != nil {
+			sc := bufio.NewScanner(stdout)
+			for sc.Scan() {
+				if k, v, ok := strings.Cut(strings.TrimSpace(sc.Text()), "="); ok {
+					onProgress(k, v)
+				}
+			}
+			// Drain anything left so ffmpeg never blocks on a full pipe.
+			io.Copy(io.Discard, stdout)
+		}
+		err = cmd.Wait()
+	}
+	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}

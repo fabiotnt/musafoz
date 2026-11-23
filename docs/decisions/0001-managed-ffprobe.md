@@ -1,6 +1,6 @@
 # 0001 Managed FFprobe
 
-Status: accepted
+Status: accepted; platform support and resolution order amended by 0005
 Date: 2026-11-22
 
 ## Context
@@ -64,7 +64,8 @@ record together.
 2. The MUSAFOZ_FFPROBE environment variable.
 3. The managed cache, populated on first use.
 
-The PATH is never searched.
+The PATH is never searched. 0005 keeps this order on macOS and adds a
+compatible tool on the PATH before the managed build on Linux and Windows.
 
 ### Compatibility policy for explicit paths
 
