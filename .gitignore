@@ -1,0 +1,15 @@
+# Local build artifacts
+/musafoz
+/mediactl
+/dist/
+/build/
+.DS_Store
+
+# Preview outputs and local recovery files
+*_cover.jpg
+*_preview.jpg
+*_preview.mp4
+.*.musafoz.lock
+.*.musafoz-*/
+.*.mediactl.lock
+.*.mediactl-*/
