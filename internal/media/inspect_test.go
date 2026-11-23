@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -136,6 +137,7 @@ func TestValidateInput(t *testing.T) {
 // fakeFFprobe writes a shell script that prints a fixture, or fails like
 // ffprobe does on unreadable input when fixture is empty.
 func fakeFFprobe(t *testing.T, fixtureName string) string {
+	skipWithoutShell(t)
 	t.Helper()
 	script := "#!/bin/sh\necho 'corrupt.mp4: Invalid data found when processing input' >&2\nexit 1\n"
 	if fixtureName != "" {
@@ -180,5 +182,15 @@ func TestInspectNoVideoNamesInput(t *testing.T) {
 	_, err := Inspect(context.Background(), fakeFFprobe(t, "audio_only.json"), video)
 	if !errors.Is(err, ErrNoVideoStream) || !strings.Contains(err.Error(), video) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// skipWithoutShell skips tests whose fake FFmpeg and FFprobe are shell
+// scripts, which Windows cannot run. Windows is covered by the integration
+// tests with real tools and by the manual procedure in the README.
+func skipWithoutShell(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake tools are shell scripts")
 	}
 }

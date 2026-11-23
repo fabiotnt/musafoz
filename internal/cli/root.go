@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"runtime"
 
 	"github.com/spf13/cobra"
 
+	"github.com/fabiotnt/musafoz/internal/media"
 	"github.com/fabiotnt/musafoz/internal/tools"
 )
 
@@ -20,16 +22,19 @@ type Env struct {
 	Getenv func(string) string
 	GOOS   string
 	GOARCH string
+	// LookPath finds a tool on the PATH where the platform searches it.
+	LookPath func(string) (string, error)
 }
 
 // DefaultEnv returns the real process environment.
 func DefaultEnv() Env {
 	return Env{
-		Stdout: os.Stdout,
-		Stderr: os.Stderr,
-		Getenv: os.Getenv,
-		GOOS:   runtime.GOOS,
-		GOARCH: runtime.GOARCH,
+		Stdout:   os.Stdout,
+		Stderr:   os.Stderr,
+		Getenv:   os.Getenv,
+		GOOS:     runtime.GOOS,
+		GOARCH:   runtime.GOARCH,
+		LookPath: exec.LookPath,
 	}
 }
 
@@ -50,12 +55,13 @@ func NewRootCommand(env Env) *cobra.Command {
 	root.SetOut(env.Stdout)
 	root.SetErr(env.Stderr)
 	root.PersistentFlags().StringVar(&opts.ffprobe, "ffprobe", "",
-		"path to an ffprobe executable to use instead of the managed one (overrides "+tools.EnvFFprobe+")")
+		"path to the ffprobe executable to use (overrides "+tools.EnvFFprobe+", the PATH, and the managed build)")
 	root.PersistentFlags().StringVar(&opts.ffmpeg, "ffmpeg", "",
-		"path to an ffmpeg executable to use instead of the managed one (overrides "+tools.EnvFFmpeg+")")
+		"path to the ffmpeg executable to use (overrides "+tools.EnvFFmpeg+", the PATH, and the managed build)")
 
 	root.AddCommand(newInspectCommand(env, opts))
 	root.AddCommand(newPreviewCommand(env, opts))
+	root.AddCommand(newLicensesCommand(env))
 	return root
 }
 
@@ -70,25 +76,36 @@ func Execute(ctx context.Context) int {
 }
 
 // resolveTool applies the resolution order for a managed tool: the flag,
-// then its environment variable, then the managed cache. Status and
+// then its environment variable, then a compatible tool on the PATH on
+// Linux and Windows, then the managed build. The choice, status, and
 // progress go to stderr only.
 func resolveTool(ctx context.Context, env Env, tool, flagPath string) (tools.Resolved, error) {
 	ro := tools.ResolveOptions{
-		Tool:     tool,
-		FlagPath: flagPath,
-		EnvPath:  env.Getenv(tools.EnvVar(tool)),
+		Tool:       tool,
+		FlagPath:   flagPath,
+		EnvPath:    env.Getenv(tools.EnvVar(tool)),
+		SearchPath: tools.SearchesPath(env.GOOS),
+		LookPath:   env.LookPath,
 		Warnf: func(format string, args ...any) {
 			fmt.Fprintf(env.Stderr, "warning: "+format+"\n", args...)
 		},
+		Logf: func(format string, args ...any) {
+			fmt.Fprintf(env.Stderr, format+"\n", args...)
+		},
+	}
+	if tool == tools.ToolFFmpeg {
+		ro.Check = media.CheckFFmpegFeatures
 	}
 	if ro.FlagPath == "" && ro.EnvPath == "" {
 		artifact, err := tools.LookupArtifact(tool, env.GOOS, env.GOARCH)
 		if err != nil {
-			return tools.Resolved{}, err
+			ro.ManagerErr = err
+			return tools.Resolve(ctx, ro)
 		}
 		cacheRoot, err := tools.DefaultCacheRoot(env.Getenv(tools.EnvCacheDir))
 		if err != nil {
-			return tools.Resolved{}, err
+			ro.ManagerErr = err
+			return tools.Resolve(ctx, ro)
 		}
 		progress := newProgress(env.Stderr)
 		ro.Manager = &tools.Manager{

@@ -1,7 +1,9 @@
 package tools
 
 import (
+	"archive/tar"
 	"archive/zip"
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,8 +14,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
+
+	"github.com/ulikunitz/xz"
 
 	"github.com/fabiotnt/musafoz/internal/fslock"
 )
@@ -31,6 +36,9 @@ type Manager struct {
 	Progress func(done, total int64)
 	// Logf, when set, receives status messages.
 	Logf func(format string, args ...any)
+	// Siblings, when set, replaces the manifest lookup of other tools stored
+	// in the same archive. Tests use it.
+	Siblings []Artifact
 }
 
 // DefaultCacheRoot returns the base cache directory. A non-empty override,
@@ -64,18 +72,21 @@ func (m *Manager) BinaryPath() string {
 // Ensure returns the path of a verified executable, downloading and
 // installing it first when the cache is empty or fails verification.
 // Concurrent callers share one installation: the install runs under a file
-// lock and the finished directory appears through an atomic rename, so a
-// partial install is never visible at BinaryPath.
+// lock per archive and each finished directory appears through an atomic
+// rename, so a partial install is never visible at BinaryPath. When other
+// pinned tools come from the same archive, they are installed from the same
+// download.
 func (m *Manager) Ensure(ctx context.Context) (string, error) {
 	bin := m.BinaryPath()
 	if err := verifyFile(bin, m.Artifact.BinarySize, m.Artifact.BinarySHA256); err == nil {
 		return bin, nil
 	}
 
-	if err := os.MkdirAll(m.toolDir(), 0o755); err != nil {
+	tools := filepath.Join(m.Root, "tools")
+	if err := os.MkdirAll(tools, 0o755); err != nil {
 		return "", fmt.Errorf("create tool cache: %w", err)
 	}
-	unlock, err := fslock.Lock(ctx, filepath.Join(m.toolDir(), ".lock"), func() {
+	unlock, err := fslock.Lock(ctx, filepath.Join(tools, "."+m.Artifact.archiveKey()+".lock"), func() {
 		m.logf("waiting for another musafoz process to finish installing %s", m.Artifact.Tool)
 	})
 	if err != nil {
@@ -83,21 +94,29 @@ func (m *Manager) Ensure(ctx context.Context) (string, error) {
 	}
 	defer unlock()
 
-	// Another process may have finished the install while we waited.
-	err = verifyFile(bin, m.Artifact.BinarySize, m.Artifact.BinarySHA256)
-	if err == nil {
-		return bin, nil
-	}
-	if !errors.Is(err, fs.ErrNotExist) {
-		m.logf("cached %s failed verification (%v); reinstalling", m.Artifact.Tool, err)
-		if err := os.RemoveAll(m.InstallDir()); err != nil {
-			return "", fmt.Errorf("remove invalid cached %s: %w", m.Artifact.Tool, err)
+	// Another process may have finished the install while we waited. Find
+	// every tool of this archive that still needs installing.
+	var pending []*Manager
+	for _, a := range m.archiveArtifacts() {
+		sm := *m
+		sm.Artifact = a
+		err := verifyFile(sm.BinaryPath(), a.BinarySize, a.BinarySHA256)
+		if err == nil {
+			continue
 		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			m.logf("cached %s failed verification (%v); reinstalling", a.Tool, err)
+			if err := os.RemoveAll(sm.InstallDir()); err != nil {
+				return "", fmt.Errorf("remove invalid cached %s: %w", a.Tool, err)
+			}
+		}
+		pending = append(pending, &sm)
 	}
-	m.removeStaleTemp()
-
-	if err := m.install(ctx); err != nil {
-		return "", err
+	if len(pending) > 0 {
+		m.removeStaleTemp()
+		if err := m.install(ctx, pending); err != nil {
+			return "", err
+		}
 	}
 	if err := verifyFile(bin, m.Artifact.BinarySize, m.Artifact.BinarySHA256); err != nil {
 		return "", fmt.Errorf("verify installed %s: %w", m.Artifact.Tool, err)
@@ -105,58 +124,111 @@ func (m *Manager) Ensure(ctx context.Context) (string, error) {
 	return bin, nil
 }
 
-// removeStaleTemp deletes leftovers from interrupted installs. It must only
-// run while holding the lock, because only the lock holder creates them.
+// archiveArtifacts returns the tools stored in the archive of m.Artifact,
+// m.Artifact first.
+func (m *Manager) archiveArtifacts() []Artifact {
+	list := m.Siblings
+	if list == nil {
+		list = siblings(m.Artifact)
+	}
+	out := []Artifact{m.Artifact}
+	for _, a := range list {
+		if a.Tool != m.Artifact.Tool && a.URL == m.Artifact.URL && a.ArchiveSHA256 == m.Artifact.ArchiveSHA256 {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func (m *Manager) tempPrefix() string {
+	return ".tmp-" + m.Artifact.archiveKey() + "-"
+}
+
+// removeStaleTemp deletes leftovers from interrupted installs of this
+// archive. It must only run while holding the archive lock, because only
+// the lock holder creates them.
 func (m *Manager) removeStaleTemp() {
-	entries, err := os.ReadDir(m.toolDir())
+	tools := filepath.Join(m.Root, "tools")
+	entries, err := os.ReadDir(tools)
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), ".tmp-") {
-			_ = os.RemoveAll(filepath.Join(m.toolDir(), e.Name()))
+		if strings.HasPrefix(e.Name(), m.tempPrefix()) {
+			_ = os.RemoveAll(filepath.Join(tools, e.Name()))
+		}
+	}
+	// Installs before archive locks kept their temporary files per tool.
+	for _, a := range m.archiveArtifacts() {
+		dir := filepath.Join(m.Root, "tools", a.Tool)
+		entries, _ := os.ReadDir(dir)
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), ".tmp-") {
+				_ = os.RemoveAll(filepath.Join(dir, e.Name()))
+			}
 		}
 	}
 }
 
-func (m *Manager) install(ctx context.Context) error {
+// install downloads the archive once, extracts and checks every pending
+// tool, and moves each into place.
+func (m *Manager) install(ctx context.Context, pending []*Manager) error {
 	a := m.Artifact
-	tmp, err := os.MkdirTemp(m.toolDir(), ".tmp-")
+	tmp, err := os.MkdirTemp(filepath.Join(m.Root, "tools"), m.tempPrefix())
 	if err != nil {
 		return fmt.Errorf("create temporary install directory: %w", err)
 	}
 	defer os.RemoveAll(tmp)
 
-	archive := filepath.Join(tmp, "archive.zip")
-	m.logf("downloading %s %s for %s from %s", a.Tool, a.Version, a.Platform(), a.URL)
+	archive := filepath.Join(tmp, "archive")
+	names := make([]string, len(pending))
+	for i, p := range pending {
+		names[i] = p.Artifact.Tool
+	}
+	m.logf("downloading %s %s for %s from %s", strings.Join(names, " and "), a.Version, a.Platform(), a.URL)
 	if err := m.download(ctx, archive); err != nil {
 		return err
 	}
 
-	stage := filepath.Join(tmp, "install")
-	if err := os.Mkdir(stage, 0o755); err != nil {
-		return fmt.Errorf("create staging directory: %w", err)
+	wanted := map[string]extractTarget{}
+	for i, p := range pending {
+		stage := filepath.Join(tmp, fmt.Sprintf("install-%d", i))
+		if err := os.Mkdir(stage, 0o755); err != nil {
+			return fmt.Errorf("create staging directory: %w", err)
+		}
+		wanted[p.Artifact.entry()] = extractTarget{artifact: p.Artifact, dest: filepath.Join(stage, p.Artifact.BinaryName)}
 	}
-	staged := filepath.Join(stage, a.BinaryName)
-	if err := extractBinary(archive, a, staged); err != nil {
-		return fmt.Errorf("extract %s from %s: %w", a.BinaryName, a.URL, err)
+	m.logf("extracting %s", strings.Join(names, " and "))
+	if err := extractBinaries(archive, a.URL, wanted); err != nil {
+		return fmt.Errorf("extract from %s: %w", a.URL, err)
 	}
 	if err := os.Remove(archive); err != nil {
 		return fmt.Errorf("remove downloaded archive: %w", err)
 	}
 
-	line, err := versionLine(ctx, staged)
-	if err != nil {
-		return fmt.Errorf("check downloaded %s: %w", a.Tool, err)
+	for i, p := range pending {
+		pa := p.Artifact
+		staged := filepath.Join(tmp, fmt.Sprintf("install-%d", i), pa.BinaryName)
+		line, err := versionLine(ctx, staged)
+		if err != nil {
+			if pa.GOOS == "linux" {
+				return fmt.Errorf("check downloaded %s: %w; the managed Linux build needs glibc 2.28 or newer, so on other systems install %s on the PATH or set --%s", pa.Tool, err, pa.Tool, pa.Tool)
+			}
+			return fmt.Errorf("check downloaded %s: %w", pa.Tool, err)
+		}
+		if !strings.HasPrefix(line, pa.VersionPrefix) {
+			return fmt.Errorf("downloaded %s reports %q, expected %q", pa.Tool, line, pa.VersionPrefix)
+		}
 	}
-	if !strings.HasPrefix(line, a.VersionPrefix) {
-		return fmt.Errorf("downloaded %s reports %q, expected %q", a.Tool, line, a.VersionPrefix)
+	for i, p := range pending {
+		if err := os.MkdirAll(p.toolDir(), 0o755); err != nil {
+			return fmt.Errorf("create tool cache: %w", err)
+		}
+		if err := os.Rename(filepath.Join(tmp, fmt.Sprintf("install-%d", i)), p.InstallDir()); err != nil {
+			return fmt.Errorf("install %s into cache: %w", p.Artifact.Tool, err)
+		}
+		m.logf("installed %s %s at %s", p.Artifact.Tool, p.Artifact.Version, p.BinaryPath())
 	}
-
-	if err := os.Rename(stage, m.InstallDir()); err != nil {
-		return fmt.Errorf("install %s into cache: %w", a.Tool, err)
-	}
-	m.logf("installed %s %s at %s", a.Tool, a.Version, m.BinaryPath())
 	return nil
 }
 
@@ -175,7 +247,7 @@ func (m *Manager) download(ctx context.Context, dest string) error {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("download %s: %w; check the network connection or set --ffprobe or %s", a.URL, err, EnvFFprobe)
+		return fmt.Errorf("download %s: %w; check the network connection or set --%s or %s", a.URL, err, a.Tool, EnvVar(a.Tool))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -209,53 +281,123 @@ func (m *Manager) download(ctx context.Context, dest string) error {
 	return nil
 }
 
-// extractBinary copies the single expected entry out of a verified archive
-// and checks its size and hash. No other entry is written to disk.
-func extractBinary(archive string, a Artifact, dest string) error {
+type extractTarget struct {
+	artifact Artifact
+	dest     string
+}
+
+// extractBinaries copies the expected entries out of a verified archive and
+// checks their sizes and hashes. No other entry is written to disk. ZIP and
+// .tar.xz archives are supported; the format follows the URL.
+func extractBinaries(archive, url string, wanted map[string]extractTarget) error {
+	found := map[string]bool{}
+	var err error
+	switch {
+	case strings.HasSuffix(url, ".zip"):
+		err = extractZip(archive, wanted, found)
+	case strings.HasSuffix(url, ".tar.xz"):
+		err = extractTarXZ(archive, wanted, found)
+	default:
+		err = fmt.Errorf("unsupported archive format")
+	}
+	if err != nil {
+		return err
+	}
+	for name := range wanted {
+		if !found[name] {
+			return fmt.Errorf("entry %q not found in archive", name)
+		}
+	}
+	return nil
+}
+
+func extractZip(archive string, wanted map[string]extractTarget, found map[string]bool) error {
 	zr, err := zip.OpenReader(archive)
 	if err != nil {
 		return err
 	}
 	defer zr.Close()
-
-	var entry *zip.File
 	for _, f := range zr.File {
-		if f.Name == a.BinaryName {
-			entry = f
-			break
+		t, ok := wanted[f.Name]
+		if !ok || found[f.Name] {
+			continue
 		}
+		if !f.Mode().IsRegular() {
+			return fmt.Errorf("entry %q is not a regular file", f.Name)
+		}
+		if f.UncompressedSize64 != uint64(t.artifact.BinarySize) {
+			return fmt.Errorf("entry %q is %d bytes, expected %d", f.Name, f.UncompressedSize64, t.artifact.BinarySize)
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		err = writeVerified(rc, f.Name, t)
+		rc.Close()
+		if err != nil {
+			return err
+		}
+		found[f.Name] = true
 	}
-	if entry == nil {
-		return fmt.Errorf("entry %q not found in archive", a.BinaryName)
-	}
-	if !entry.Mode().IsRegular() {
-		return fmt.Errorf("entry %q is not a regular file", a.BinaryName)
-	}
-	if entry.UncompressedSize64 != uint64(a.BinarySize) {
-		return fmt.Errorf("entry %q is %d bytes, expected %d", a.BinaryName, entry.UncompressedSize64, a.BinarySize)
-	}
+	return nil
+}
 
-	rc, err := entry.Open()
+func extractTarXZ(archive string, wanted map[string]extractTarget, found map[string]bool) error {
+	f, err := os.Open(archive)
 	if err != nil {
 		return err
 	}
-	defer rc.Close()
-	out, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
+	defer f.Close()
+	xr, err := xz.NewReader(bufio.NewReaderSize(f, 1<<20))
+	if err != nil {
+		return err
+	}
+	tr := tar.NewReader(xr)
+	for len(found) < len(wanted) {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		t, ok := wanted[h.Name]
+		if !ok || found[h.Name] {
+			continue
+		}
+		if h.Typeflag != tar.TypeReg {
+			return fmt.Errorf("entry %q is not a regular file", h.Name)
+		}
+		if h.Size != t.artifact.BinarySize {
+			return fmt.Errorf("entry %q is %d bytes, expected %d", h.Name, h.Size, t.artifact.BinarySize)
+		}
+		if err := writeVerified(tr, h.Name, t); err != nil {
+			return err
+		}
+		found[h.Name] = true
+	}
+	return nil
+}
+
+// writeVerified writes one entry to its destination and checks its size
+// and SHA-256.
+func writeVerified(r io.Reader, name string, t extractTarget) error {
+	a := t.artifact
+	out, err := os.OpenFile(t.dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
-
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(out, h), io.LimitReader(rc, a.BinarySize+1))
+	n, err := io.Copy(io.MultiWriter(out, h), io.LimitReader(r, a.BinarySize+1))
 	if err != nil {
 		return err
 	}
 	if n != a.BinarySize {
-		return fmt.Errorf("entry %q produced %d bytes, expected %d", a.BinaryName, n, a.BinarySize)
+		return fmt.Errorf("entry %q produced %d bytes, expected %d", name, n, a.BinarySize)
 	}
 	if got := hex.EncodeToString(h.Sum(nil)); got != a.BinarySHA256 {
-		return fmt.Errorf("entry %q SHA-256 mismatch: got %s, expected %s", a.BinaryName, got, a.BinarySHA256)
+		return fmt.Errorf("entry %q SHA-256 mismatch: got %s, expected %s", name, got, a.BinarySHA256)
 	}
 	if err := out.Sync(); err != nil {
 		return err
@@ -263,7 +405,7 @@ func extractBinary(archive string, a Artifact, dest string) error {
 	if err := out.Close(); err != nil {
 		return err
 	}
-	return os.Chmod(dest, 0o755)
+	return os.Chmod(t.dest, 0o755)
 }
 
 // verifyFile checks that path is a regular executable file with the pinned
@@ -279,7 +421,7 @@ func verifyFile(path string, size int64, sum string) error {
 	if fi.Size() != size {
 		return fmt.Errorf("%s is %d bytes, expected %d", path, fi.Size(), size)
 	}
-	if fi.Mode().Perm()&0o100 == 0 {
+	if runtime.GOOS != "windows" && fi.Mode().Perm()&0o100 == 0 {
 		return fmt.Errorf("%s is not executable", path)
 	}
 	f, err := os.Open(path)

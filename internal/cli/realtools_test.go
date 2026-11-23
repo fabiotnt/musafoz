@@ -37,11 +37,12 @@ func runReal(t *testing.T, cache string, args ...string) result {
 	vars := map[string]string{"MUSAFOZ_CACHE_DIR": cache}
 	var stdout, stderr strings.Builder
 	env := Env{
-		Stdout: &stdout,
-		Stderr: &stderr,
-		Getenv: func(k string) string { return vars[k] },
-		GOOS:   runtime.GOOS,
-		GOARCH: runtime.GOARCH,
+		Stdout:   &stdout,
+		Stderr:   &stderr,
+		Getenv:   func(k string) string { return vars[k] },
+		GOOS:     runtime.GOOS,
+		GOARCH:   runtime.GOARCH,
+		LookPath: exec.LookPath,
 	}
 	cmd := NewRootCommand(env)
 	cmd.SetArgs(args)

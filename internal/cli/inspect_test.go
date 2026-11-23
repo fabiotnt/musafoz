@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"github.com/fabiotnt/musafoz/internal/media"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -17,6 +20,7 @@ func testdata(parts ...string) string {
 // fakeFFprobe writes an executable that reports a release version and
 // prints the given ffprobe JSON fixture.
 func fakeFFprobe(t *testing.T, fixture string) string {
+	skipWithoutShell(t)
 	t.Helper()
 	abs, err := filepath.Abs(testdata("ffprobe", fixture))
 	if err != nil {
@@ -72,7 +76,8 @@ func TestInspectText(t *testing.T) {
 			t.Errorf("stdout lacks %q:\n%s", want, r.stdout)
 		}
 	}
-	if r.stderr != "" {
+	// stderr only names the tool that was used.
+	if !strings.HasPrefix(r.stderr, "using ffprobe ") || strings.Count(r.stderr, "\n") != 1 {
 		t.Errorf("unexpected stderr: %q", r.stderr)
 	}
 }
@@ -160,17 +165,60 @@ func TestInspectUsesEnvironmentFFprobe(t *testing.T) {
 
 func TestInspectUnsupportedPlatform(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	env := Env{Stdout: &stdout, Stderr: &stderr, Getenv: func(string) string { return "" }, GOOS: "linux", GOARCH: "amd64"}
+	env := Env{Stdout: &stdout, Stderr: &stderr, Getenv: func(string) string { return "" }, GOOS: "linux", GOARCH: "arm64",
+		LookPath: func(string) (string, error) { return "", errors.New("not found") }}
 	cmd := NewRootCommand(env)
 	cmd.SetArgs([]string{"inspect", testdata("video", "sample.mp4")})
 	err := cmd.Execute()
-	if err == nil || !strings.Contains(err.Error(), "no managed ffprobe build for linux/amd64") {
+	if err == nil || !strings.Contains(err.Error(), "no ffprobe on the PATH") ||
+		!strings.Contains(err.Error(), "no managed ffprobe build for linux/arm64") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// On Linux a compatible ffprobe on the PATH is used, and stderr says so.
+func TestInspectUsesPathOnLinux(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	probe := fakeFFprobe(t, "sample.json")
+	env := Env{Stdout: &stdout, Stderr: &stderr, Getenv: func(string) string { return "" }, GOOS: "linux", GOARCH: "amd64",
+		LookPath: func(name string) (string, error) {
+			if name != "ffprobe" {
+				t.Errorf("looked up %q", name)
+			}
+			return probe, nil
+		}}
+	cmd := NewRootCommand(env)
+	cmd.SetArgs([]string{"inspect", "--json", testdata("video", "sample.mp4")})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("%v\n%s", err, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "using ffprobe "+probe+" (found on the PATH: ffprobe version") {
+		t.Errorf("stderr = %q", stderr.String())
 	}
 }
 
 func TestInspectRequiresOneArgument(t *testing.T) {
 	if r := run(t, nil, "inspect"); r.err == nil {
 		t.Fatal("expected an error")
+	}
+}
+
+// skipWithoutShell skips tests whose fake FFmpeg and FFprobe are shell
+// scripts, which Windows cannot run. Windows is covered by the integration
+// tests with real tools and by the manual procedure in the README.
+func skipWithoutShell(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake tools are shell scripts")
+	}
+}
+
+func TestLicensesShowsEmbeddedFontNotice(t *testing.T) {
+	r := run(t, nil, "licenses")
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if !strings.Contains(r.stdout, "DejaVu Sans Mono 2.37") || !strings.HasSuffix(r.stdout, media.EmbeddedFontLicense) {
+		t.Errorf("licenses output lacks the font notice:\n%s", r.stdout)
 	}
 }

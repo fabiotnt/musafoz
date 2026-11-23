@@ -4,6 +4,7 @@ package tools
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -16,12 +17,16 @@ type Artifact struct {
 	// GOOS and GOARCH identify the platform the build runs on.
 	GOOS   string
 	GOARCH string
-	// URL is the versioned HTTPS download location of the ZIP archive.
+	// URL is the versioned HTTPS download location of the archive, a .zip
+	// or .tar.xz file. Several tools may share one archive.
 	URL string
-	// ArchiveSize and ArchiveSHA256 pin the ZIP archive.
+	// ArchiveSize and ArchiveSHA256 pin the archive.
 	ArchiveSize   int64
 	ArchiveSHA256 string
-	// BinaryName is the name of the executable entry inside the archive.
+	// ArchiveEntry is the path of the executable inside the archive. When
+	// empty, it is BinaryName.
+	ArchiveEntry string
+	// BinaryName is the file name of the installed executable.
 	BinaryName string
 	// BinarySize and BinarySHA256 pin the extracted executable.
 	BinarySize   int64
@@ -34,6 +39,39 @@ type Artifact struct {
 func (a Artifact) Platform() string {
 	return a.GOOS + "/" + a.GOARCH
 }
+
+// entry returns the path of the executable inside the archive.
+func (a Artifact) entry() string {
+	if a.ArchiveEntry != "" {
+		return a.ArchiveEntry
+	}
+	return a.BinaryName
+}
+
+// archiveKey names the archive in lock and temporary file names. Tools that
+// share an archive share its key, and therefore one lock and one download.
+func (a Artifact) archiveKey() string {
+	return a.ArchiveSHA256[:min(16, len(a.ArchiveSHA256))]
+}
+
+// SearchesPath reports whether tool resolution looks for a compatible tool
+// on the PATH before using the managed build. On macOS the managed build is
+// the default; on Linux and Windows an installed tool is used when it
+// passes the compatibility checks.
+func SearchesPath(goos string) bool {
+	return goos == "linux" || goos == "windows"
+}
+
+// The Linux and Windows builds come from one BtbN FFmpeg-Builds release.
+// BtbN keeps the last build of each month long term, so the pin uses one.
+const (
+	btbnRelease  = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-31-12-59/"
+	btbnVersion  = "n9.0.2-39-g7adfbe40dc"
+	btbnLinuxDir = "ffmpeg-" + btbnVersion + "-linux64-gpl-9.0"
+	btbnLinuxURL = btbnRelease + btbnLinuxDir + ".tar.xz"
+	btbnWinDir   = "ffmpeg-" + btbnVersion + "-win64-gpl-9.0"
+	btbnWinURL   = btbnRelease + btbnWinDir + ".zip"
+)
 
 // artifacts lists the pinned FFmpeg and FFprobe builds. See
 // docs/decisions for how each entry was verified.
@@ -64,6 +102,62 @@ var artifacts = []Artifact{
 		BinarySHA256:  "1e3026f19f8b8d67c5fa0987aa3bac376d45c7b0e0485dc22515fc011546f8c2",
 		VersionPrefix: "ffmpeg version 9.1-tessus",
 	},
+	{
+		Tool:          "ffprobe",
+		Version:       btbnVersion,
+		GOOS:          "linux",
+		GOARCH:        "amd64",
+		URL:           btbnLinuxURL,
+		ArchiveSize:   153175100,
+		ArchiveSHA256: "73e29a56974ae5a651133a04584c7483b21afe941e17dc91d79814a758b608d3",
+		ArchiveEntry:  btbnLinuxDir + "/bin/ffprobe",
+		BinaryName:    "ffprobe",
+		BinarySize:    173300552,
+		BinarySHA256:  "ae9051af68f52e7ad5706b442577689c74c02da618ca1590caf1ac7199f2931c",
+		VersionPrefix: "ffprobe version " + btbnVersion + "-20261031",
+	},
+	{
+		Tool:          "ffmpeg",
+		Version:       btbnVersion,
+		GOOS:          "linux",
+		GOARCH:        "amd64",
+		URL:           btbnLinuxURL,
+		ArchiveSize:   153175100,
+		ArchiveSHA256: "73e29a56974ae5a651133a04584c7483b21afe941e17dc91d79814a758b608d3",
+		ArchiveEntry:  btbnLinuxDir + "/bin/ffmpeg",
+		BinaryName:    "ffmpeg",
+		BinarySize:    173534088,
+		BinarySHA256:  "384742b75419584d065bbf372613f9f7e8ccf22525b421c16a2ee679a78ee748",
+		VersionPrefix: "ffmpeg version " + btbnVersion + "-20261031",
+	},
+	{
+		Tool:          "ffprobe",
+		Version:       btbnVersion,
+		GOOS:          "windows",
+		GOARCH:        "amd64",
+		URL:           btbnWinURL,
+		ArchiveSize:   195110184,
+		ArchiveSHA256: "693f3e224bc184b40524a62ca47526cfebaf2504414021b92fe75f677ad868b9",
+		ArchiveEntry:  btbnWinDir + "/bin/ffprobe.exe",
+		BinaryName:    "ffprobe.exe",
+		BinarySize:    165783040,
+		BinarySHA256:  "075848c1bbb8b4e2e0b0ecba06e8ad06c889a8902ed219d6a9f5758c417ca108",
+		VersionPrefix: "ffprobe version " + btbnVersion + "-20261031",
+	},
+	{
+		Tool:          "ffmpeg",
+		Version:       btbnVersion,
+		GOOS:          "windows",
+		GOARCH:        "amd64",
+		URL:           btbnWinURL,
+		ArchiveSize:   195110184,
+		ArchiveSHA256: "693f3e224bc184b40524a62ca47526cfebaf2504414021b92fe75f677ad868b9",
+		ArchiveEntry:  btbnWinDir + "/bin/ffmpeg.exe",
+		BinaryName:    "ffmpeg.exe",
+		BinarySize:    165984256,
+		BinarySHA256:  "c930b63cb1ee8b7e2eaf9c15161160edd5c9acad34f0303b5855c8eb142a7e8d",
+		VersionPrefix: "ffmpeg version " + btbnVersion + "-20261031",
+	},
 }
 
 // FFprobeArtifact returns the pinned FFprobe build for the given platform.
@@ -93,4 +187,19 @@ func supportedPlatforms(tool string) string {
 		return "none"
 	}
 	return strings.Join(list, ", ")
+}
+
+// siblings returns the pinned artifacts stored in the same archive as a,
+// a included.
+func siblings(a Artifact) []Artifact {
+	var list []Artifact
+	for _, b := range artifacts {
+		if b.URL == a.URL && b.ArchiveSHA256 == a.ArchiveSHA256 && b.Platform() == a.Platform() {
+			list = append(list, b)
+		}
+	}
+	if !slices.ContainsFunc(list, func(b Artifact) bool { return b.Tool == a.Tool }) {
+		list = append([]Artifact{a}, list...)
+	}
+	return list
 }

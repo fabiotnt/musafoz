@@ -23,13 +23,15 @@ one output set.
 ### Order of checks
 
 1. Validate options and the input path. --faststart-in-place is accepted only
-   for .mp4, .m4v, and .mov files.
+   for .mp4, .m4v, and .mov files. A --font file must exist and be a
+   TrueType or OpenType font (see 0006).
 2. Take the output-set lock (below).
 3. Without --overwrite, stop if any output exists and list every conflict.
 4. Resolve FFprobe and inspect the input. Preview requires a readable file, a
    real video track, and a known positive duration. The inspect command keeps
-   accepting files with an unknown duration.
-5. Resolve FFmpeg and check its features, then find the overlay font.
+   accepting files with an unknown duration. A --cover-at time must not pass
+   the start of the last video frame (see 0007).
+5. Resolve FFmpeg and check its features.
 
 A failure in any of these steps reports the path, the step, and the reason,
 and creates no outputs. FFmpeg is not resolved or downloaded for inputs that
@@ -121,7 +123,7 @@ ratio counts as square pixels.
 - The preview video takes the size of the frames, rounded down to even
   values, with a 1:1 sample aspect ratio, so its display aspect ratio is the
   source's.
-- The 10 by 10 grid is the largest grid with the displayed aspect ratio
+- The grid area is the largest area with the displayed aspect ratio
   that fits in 4K in the video's orientation: 3840x2160 for landscape and
   square sources, 2160x3840 for portrait ones. The source resolution does
   not matter: a 320x180 and an 8K 16:9 source both give 3840x2160. Cells
@@ -130,10 +132,12 @@ ratio counts as square pixels.
   3:4, and 216x216 for 1:1. The grids are therefore 3840x2160, 2160x3840,
   2880x2160, 2160x2880, and 2160x2160. The 40-pixel header is added above
   the grid and is not part of the grid aspect ratio, so the JPEG height is
-  the grid height plus 40.
-- The timestamp overlay is sized from the mosaic cell rather than in fixed
-  frame pixels. In the mosaic, the font is 12.8 pixels, the margin 5, and
-  the box border 1.6, for every source. On the extracted frame these are
+  the grid height plus 40. The cell sizes above are those of the 10 by 10
+  grid; 0007 makes the grid follow the frame count inside the same area.
+- The timestamp overlay is sized from the 10 by 10 mosaic cell rather than
+  in fixed frame pixels. In a 10 by 10 mosaic, the font is 12.8 pixels, the
+  margin 5, and the box border 1.6, for every source; smaller grids show it
+  larger (see 0007). On the extracted frame these are
   multiplied by frame width / cell width, which gives the reference values
   64, 25, and 8 for a 1920x1080 source and 128, 50, and 16 for a 2160x3840
   phone video. The preview video uses the same frames, so the overlay keeps
@@ -145,16 +149,22 @@ ratio counts as square pixels.
   start of the last video frame, instead of whole seconds. The overlay still
   shows HH:MM:SS. Very short clips can repeat a frame.
 - The cover timestamp is a fractional value in the same 15 to 85 percent
-  range, also capped at the last frame.
+  range, also capped at the last frame. 0007 adds --cover-at and replaces
+  the midpoint of clips of 10 seconds or less with a random time.
 - The mosaic header shows the real file name, including its extension.
+- The timestamps and the mosaic header use the embedded DejaVu Sans Mono
+  2.37 instead of Andale Mono (see 0006). Sizes and positions follow the
+  rules below; the glyph shapes differ, so a pixel comparison with the
+  reference shows small differences in the overlay areas even where the
+  layout matches.
 - The preview video is converted to limited-range yuv420p. With FFmpeg 9.1
   the reference command produces full-range yuvj420p from JPEG frames.
 - Odd frame dimensions are rounded down to even values for libx264.
 - The reference script can use h264_nvenc for preview encoding. MusaFoz
   uses h264_videotoolbox on macOS when the hardware probe succeeds, and
   libx264 as the fallback or when --accel cpu is set (see 0004).
-- The mosaic grid is fixed at 10 by 10 and --frames accepts 1 to 100; empty
-  cells are black.
+- --frames accepts 1 to 100. The reference grid is fixed at 10 by 10; 0007
+  makes the musafoz grid follow the frame count. Empty cells are black.
 - The mosaic grid takes the displayed aspect ratio of the source instead of
   a fixed 16:9 canvas (see Displayed aspect ratio below). For 16:9 sources
   the result matches the reference size, 3840x2200. For other sources it
@@ -196,6 +206,7 @@ candidate optimization for a later delivery.
 The reference script targets Linux. For comparisons on macOS, a temporary
 copy outside the repository is adjusted in three places only: the temporary
 frame directory uses mktemp instead of /dev/shm, the CPU count falls back to
-sysctl, and the overlay font is the macOS copy of Andale Mono. The copy runs
+sysctl, and the overlay font is the macOS copy of Andale Mono, as in the
+reference. musafoz itself uses its embedded font. The copy runs
 with the managed FFmpeg and FFprobe first on its PATH. internal/cli/parity_test.go
 (build tag parity) runs both sides on separate copies of the same inputs.

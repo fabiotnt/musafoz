@@ -1,22 +1,28 @@
 package tools
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ulikunitz/xz"
 )
 
 const fakeVersionLine = "ffprobe version 9.1-tessus  https://evermeet.cx/ffmpeg/"
@@ -67,6 +73,7 @@ func newTestServer(t *testing.T, body []byte) *testServer {
 // setup returns a manager whose artifact points at a local TLS server that
 // serves a fake ffprobe build.
 func setup(t *testing.T, script []byte) (*Manager, *testServer) {
+	skipWithoutShell(t)
 	t.Helper()
 	archive := zipOf(t, "ffprobe", script)
 	ts := newTestServer(t, archive)
@@ -89,10 +96,12 @@ func setup(t *testing.T, script []byte) (*Manager, *testServer) {
 
 func assertNoLeftovers(t *testing.T, m *Manager) {
 	t.Helper()
-	entries, _ := os.ReadDir(m.toolDir())
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), ".tmp-") {
-			t.Errorf("temporary directory left behind: %s", e.Name())
+	for _, dir := range []string{m.toolDir(), filepath.Join(m.Root, "tools")} {
+		entries, _ := os.ReadDir(dir)
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), ".tmp-") {
+				t.Errorf("temporary directory left behind: %s", e.Name())
+			}
 		}
 	}
 }
@@ -220,9 +229,13 @@ func TestEnsureConcurrentCallersShareOneInstall(t *testing.T) {
 
 func TestEnsureCleansStaleTemporaryDirectories(t *testing.T) {
 	m, _ := setup(t, fakeScript(fakeVersionLine))
-	stale := filepath.Join(m.toolDir(), ".tmp-12345")
-	if err := os.MkdirAll(stale, 0o755); err != nil {
-		t.Fatal(err)
+	for _, stale := range []string{
+		filepath.Join(m.toolDir(), ".tmp-12345"),
+		filepath.Join(m.Root, "tools", m.tempPrefix()+"12345"),
+	} {
+		if err := os.MkdirAll(stale, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := m.Ensure(context.Background()); err != nil {
 		t.Fatal(err)
@@ -246,6 +259,7 @@ func TestEnsureWithoutNetworkExplainsOverride(t *testing.T) {
 }
 
 func writeExecutable(t *testing.T, content []byte) string {
+	skipWithoutShell(t)
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "ffprobe")
 	if err := os.WriteFile(path, content, 0o755); err != nil {
@@ -337,7 +351,7 @@ func TestFFprobeArtifact(t *testing.T) {
 	if !strings.Contains(a.URL, a.Version) {
 		t.Errorf("URL %s is not versioned", a.URL)
 	}
-	if _, err := FFprobeArtifact("linux", "amd64"); err == nil || !strings.Contains(err.Error(), "darwin/amd64") {
+	if _, err := FFprobeArtifact("freebsd", "amd64"); err == nil || !strings.Contains(err.Error(), "darwin/amd64") {
 		t.Errorf("unsupported platform: err = %v", err)
 	}
 }
@@ -350,7 +364,7 @@ func TestFFmpegArtifactAndResolve(t *testing.T) {
 	if a.BinaryName != "ffmpeg" || !strings.HasPrefix(a.VersionPrefix, "ffmpeg version ") || len(a.BinarySHA256) != 64 {
 		t.Errorf("incomplete ffmpeg artifact: %+v", a)
 	}
-	if _, err := LookupArtifact(ToolFFmpeg, "linux", "amd64"); err == nil || !strings.Contains(err.Error(), EnvFFmpeg) {
+	if _, err := LookupArtifact(ToolFFmpeg, "freebsd", "amd64"); err == nil || !strings.Contains(err.Error(), EnvFFmpeg) {
 		t.Errorf("unsupported platform: err = %v", err)
 	}
 
@@ -369,5 +383,217 @@ func TestFFmpegArtifactAndResolve(t *testing.T) {
 	m, _ := setup(t, fakeScript(fakeVersionLine))
 	if _, err := Resolve(ctx, ResolveOptions{Tool: ToolFFmpeg, Manager: m}); err == nil {
 		t.Error("expected an error for a mismatched manager")
+	}
+}
+
+func tarXZOf(t *testing.T, files map[string][]byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	xw, err := xz.NewWriter(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tw := tar.NewWriter(xw)
+	names := []string{"pkg/", "pkg/bin/"}
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if strings.HasSuffix(name, "/") {
+			tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeDir, Mode: 0o755})
+			continue
+		}
+		tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o755, Size: int64(len(files[name]))})
+		tw.Write(files[name])
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := xw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// A .tar.xz archive that holds both tools is downloaded once and installs
+// both, whichever tool asks first.
+func TestEnsureSharedTarXZArchive(t *testing.T) {
+	skipWithoutShell(t)
+	probe := fakeScript("ffprobe version n9.0.2-test")
+	mpeg := fakeScript("ffmpeg version n9.0.2-test")
+	archive := tarXZOf(t, map[string][]byte{
+		"pkg/bin/ffprobe": probe,
+		"pkg/bin/ffmpeg":  mpeg,
+		"pkg/bin/ffplay":  []byte("not extracted"),
+	})
+	ts := newTestServer(t, archive)
+	base := Artifact{
+		Version: "n9.0.2", GOOS: "linux", GOARCH: "amd64",
+		URL: ts.URL + "/ffmpeg-n9.0.2-linux64.tar.xz", ArchiveSize: int64(len(archive)), ArchiveSHA256: sha(archive),
+	}
+	pa, ma := base, base
+	pa.Tool, pa.ArchiveEntry, pa.BinaryName = "ffprobe", "pkg/bin/ffprobe", "ffprobe"
+	pa.BinarySize, pa.BinarySHA256, pa.VersionPrefix = int64(len(probe)), sha(probe), "ffprobe version n9.0.2"
+	ma.Tool, ma.ArchiveEntry, ma.BinaryName = "ffmpeg", "pkg/bin/ffmpeg", "ffmpeg"
+	ma.BinarySize, ma.BinarySHA256, ma.VersionPrefix = int64(len(mpeg)), sha(mpeg), "ffmpeg version n9.0.2"
+	root := t.TempDir()
+	newManager := func(a Artifact) *Manager {
+		return &Manager{Root: root, Client: ts.Client(), Artifact: a, Siblings: []Artifact{pa, ma}}
+	}
+	ctx := context.Background()
+	if _, err := newManager(pa).Ensure(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mm := newManager(ma)
+	path, err := mm.Ensure(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != mm.BinaryPath() {
+		t.Errorf("ffmpeg path %s, want %s", path, mm.BinaryPath())
+	}
+	if got := ts.hits.Load(); got != 1 {
+		t.Errorf("server hits = %d, want 1", got)
+	}
+	if _, err := os.Stat(filepath.Join(mm.InstallDir(), "ffplay")); err == nil {
+		t.Error("an unrequested entry was extracted")
+	}
+	assertNoLeftovers(t, mm)
+
+	// A tampered sibling is reinstalled from a new download.
+	if err := os.WriteFile(mm.BinaryPath(), []byte("tampered"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newManager(ma).Ensure(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := ts.hits.Load(); got != 2 {
+		t.Errorf("server hits = %d, want 2", got)
+	}
+}
+
+func TestBtbNArtifactsShareOneArchive(t *testing.T) {
+	for _, c := range []struct{ goos, ext, exe string }{{"linux", ".tar.xz", ""}, {"windows", ".zip", ".exe"}} {
+		p, err := LookupArtifact(ToolFFprobe, c.goos, "amd64")
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := LookupArtifact(ToolFFmpeg, c.goos, "amd64")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.URL != m.URL || p.ArchiveSHA256 != m.ArchiveSHA256 || !strings.HasSuffix(p.URL, c.ext) {
+			t.Errorf("%s tools should share one %s archive: %s, %s", c.goos, c.ext, p.URL, m.URL)
+		}
+		if got := siblings(m); len(got) != 2 {
+			t.Errorf("%s siblings = %d, want 2", c.goos, len(got))
+		}
+		if !strings.Contains(p.URL, p.Version) || !strings.HasSuffix(p.ArchiveEntry, "/bin/ffprobe"+c.exe) || p.BinaryName != "ffprobe"+c.exe {
+			t.Errorf("incomplete artifact: %+v", p)
+		}
+	}
+}
+
+func TestResolveSearchesPath(t *testing.T) {
+	ctx := context.Background()
+	good := writeExecutable(t, fakeScript("ffprobe version 7.1.1-1+b1"))
+	old := writeExecutable(t, fakeScript("ffprobe version 4.4.2"))
+	lookup := func(p string) func(string) (string, error) {
+		return func(string) (string, error) {
+			if p == "" {
+				return "", errors.New("not found")
+			}
+			return p, nil
+		}
+	}
+	var logs []string
+	logf := func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+
+	managed, _ := setup(t, fakeScript(fakeVersionLine))
+	r, err := ResolveFFprobe(ctx, ResolveOptions{SearchPath: true, LookPath: lookup(good), Manager: managed, Logf: logf})
+	if err != nil || r.Source != SourcePath || r.Path != good {
+		t.Fatalf("compatible PATH tool: got %+v, %v", r, err)
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0], "found on the PATH: ffprobe version 7.1.1") {
+		t.Errorf("log = %q", logs)
+	}
+
+	// The flag still wins over the PATH.
+	r, err = ResolveFFprobe(ctx, ResolveOptions{FlagPath: old, SearchPath: true, LookPath: lookup(good)})
+	if err == nil || !strings.Contains(err.Error(), "--ffprobe") {
+		t.Errorf("an invalid flag path must fail and name the flag: %+v, %v", r, err)
+	}
+
+	cases := []struct {
+		name, path string
+		check      func(context.Context, string) error
+		reason     string
+	}{
+		{"missing", "", nil, "no ffprobe on the PATH"},
+		{"too old", old, nil, "is not compatible: ffprobe 4.4 is too old"},
+		{"failed check", good, func(context.Context, string) error { return errors.New("missing encoder libx264") }, "is not compatible: missing encoder libx264"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			logs = nil
+			m, _ := setup(t, fakeScript(fakeVersionLine))
+			r, err := ResolveFFprobe(ctx, ResolveOptions{SearchPath: true, LookPath: lookup(c.path), Check: c.check, Manager: m, Logf: logf})
+			if err != nil || r.Source != SourceManaged {
+				t.Fatalf("got %+v, %v", r, err)
+			}
+			if len(logs) != 1 || !strings.Contains(logs[0], c.reason) || !strings.Contains(logs[0], "managed 9.1 build") {
+				t.Errorf("log = %q, want %q", logs, c.reason)
+			}
+			_, err = ResolveFFprobe(ctx, ResolveOptions{SearchPath: true, LookPath: lookup(c.path), Check: c.check,
+				ManagerErr: errors.New("no managed ffprobe build for linux/arm64")})
+			if err == nil || !strings.Contains(err.Error(), c.reason) || !strings.Contains(err.Error(), "linux/arm64") {
+				t.Errorf("without a managed build: err = %v", err)
+			}
+		})
+	}
+}
+
+func TestResolveLogsManagedDefault(t *testing.T) {
+	m, _ := setup(t, fakeScript(fakeVersionLine))
+	var logs []string
+	_, err := ResolveFFprobe(context.Background(), ResolveOptions{Manager: m,
+		LookPath: func(string) (string, error) { t.Error("the PATH was searched"); return "", errors.New("no") },
+		Logf:     func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0], "the managed build is the default on this platform") {
+		t.Errorf("log = %q", logs)
+	}
+}
+
+func TestExecutablePathOnWindows(t *testing.T) {
+	saved := hostOS
+	hostOS = "windows"
+	t.Cleanup(func() { hostOS = saved })
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "ffprobe.exe")
+	txt := filepath.Join(dir, "ffprobe.txt")
+	os.WriteFile(exe, []byte("MZ"), 0o644)
+	os.WriteFile(txt, []byte("MZ"), 0o644)
+	if p, err := executablePath(exe); err != nil || p != exe {
+		t.Errorf(".exe without execute bits: %s, %v", p, err)
+	}
+	if p, err := executablePath(filepath.Join(dir, "ffprobe")); err != nil || p != exe {
+		t.Errorf("path without extension: %s, %v", p, err)
+	}
+	if _, err := executablePath(txt); err == nil || !strings.Contains(err.Error(), ".exe") {
+		t.Errorf(".txt accepted: %v", err)
+	}
+}
+
+// skipWithoutShell skips tests whose fake FFmpeg and FFprobe are shell
+// scripts, which Windows cannot run. Windows is covered by the integration
+// tests with real tools and by the manual procedure in the README.
+func skipWithoutShell(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake tools are shell scripts")
 	}
 }

@@ -1,6 +1,6 @@
 # 0002 Managed FFmpeg
 
-Status: accepted
+Status: accepted; platform support and resolution order amended by 0005
 Date: 2026-11-23
 
 ## Context
@@ -27,7 +27,8 @@ FFmpeg reuses the FFprobe mechanism unchanged:
   libx264 and mjpeg encoders and the drawtext, tile, scale, pad, and setsar
   filters. This applies to managed and explicit builds.
 
-The supported platform stays darwin/amd64.
+The supported platform stays darwin/amd64. 0005 adds Linux and Windows
+x86-64 builds and the PATH search on those platforms.
 
 ### Pinned build
 

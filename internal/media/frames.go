@@ -7,7 +7,9 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -26,17 +28,53 @@ func FrameTimes(duration float64, n int, last float64) []float64 {
 	return times
 }
 
-// CoverTime picks the cover timestamp. Videos longer than 10 seconds get a
-// random point between 15 and 85 percent of the duration; shorter videos
-// use the midpoint. The result is capped at last. r returns a number in
-// [0, 1).
+// CoverTime picks a random cover timestamp. Videos longer than 10 seconds
+// get a point between 15 and 85 percent of the duration; shorter videos get
+// a point anywhere from the start to last, the start of the last decodable
+// frame. The result is capped at last and rounded to milliseconds. r returns
+// a number in [0, 1).
 func CoverTime(duration float64, last float64, r func() float64) float64 {
-	t := duration / 2
+	lo, hi := 0.0, last
 	if duration > 10 {
-		lo, hi := duration*0.15, duration*0.85
-		t = lo + r()*(hi-lo)
+		lo, hi = duration*0.15, duration*0.85
 	}
-	return math.Min(t, last)
+	t := math.Min(lo+r()*(hi-lo), last)
+	return math.Max(0, math.Floor(t*1000)/1000)
+}
+
+// ParseTimestamp reads a timestamp written as HH:MM:SS with an optional
+// fraction of a second, such as 00:01:15.500. Hours may have any number of
+// digits; minutes and seconds have two digits below 60. The result is in
+// seconds, rounded to milliseconds.
+func ParseTimestamp(s string) (float64, error) {
+	if strings.HasPrefix(strings.TrimSpace(s), "-") {
+		return 0, fmt.Errorf("timestamp %q is negative", s)
+	}
+	m := timestampRE.FindStringSubmatch(s)
+	if m == nil {
+		return 0, fmt.Errorf("timestamp %q is not in HH:MM:SS or HH:MM:SS.fff form", s)
+	}
+	h, _ := strconv.ParseFloat(m[1], 64)
+	mins, _ := strconv.ParseFloat(m[2], 64)
+	sec, _ := strconv.ParseFloat(m[3], 64)
+	if mins >= 60 || sec >= 60 {
+		return 0, fmt.Errorf("timestamp %q has minutes or seconds of 60 or more", s)
+	}
+	v := h*3600 + mins*60 + sec
+	return math.Round(v*1000) / 1000, nil
+}
+
+var timestampRE = regexp.MustCompile(`^([0-9]+):([0-9]{2}):([0-9]{2}(?:\.[0-9]+)?)$`)
+
+// Timestamp formats seconds as HH:MM:SS, followed by milliseconds when the
+// value has a fraction, such as 00:01:15.500.
+func Timestamp(sec float64) string {
+	ms := int64(math.Round(sec * 1000))
+	s := Clock(float64(ms / 1000))
+	if ms%1000 != 0 {
+		s += fmt.Sprintf(".%03d", ms%1000)
+	}
+	return s
 }
 
 // Clock formats whole seconds as HH:MM:SS, truncating fractions.
@@ -53,9 +91,10 @@ func seconds(t float64) string {
 type FrameOptions struct {
 	FFmpeg string
 	Input  string
-	// WorkDir receives frame_NNN.jpg files. Its path must be filter safe.
+	// WorkDir receives frame_NNN.jpg files.
 	WorkDir string
-	// FontFile is a filter-safe path to the overlay font.
+	// FontFile is the overlay font. It must be inside WorkDir with a plain
+	// name, because filters refer to it relative to WorkDir.
 	FontFile string
 	Times    []float64
 	// Overlay sets the timestamp size. The zero value uses the sizes for a
@@ -65,17 +104,19 @@ type FrameOptions struct {
 	Decode DecodePath
 	// Concurrency bounds parallel ffmpeg runs. Zero means the CPU count.
 	Concurrency int
+	// OnFrame, when set, is called after each frame is written. Calls may
+	// come from several goroutines at once.
+	OnFrame func()
 }
 
 // ExtractFrames writes one JPEG per timestamp with an HH:MM:SS overlay. It
 // fails if any frame cannot be decoded, naming the first failing timestamp.
 func ExtractFrames(ctx context.Context, o FrameOptions) error {
-	if err := checkFilterPath(o.WorkDir); err != nil {
+	font, err := workFile(o.WorkDir, o.FontFile)
+	if err != nil {
 		return err
 	}
-	if err := checkFilterPath(o.FontFile); err != nil {
-		return err
-	}
+	o.FontFile = font
 	workers := o.Decode.Workers(o.Concurrency)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -96,6 +137,8 @@ func ExtractFrames(ctx context.Context, o FrameOptions) error {
 			if err := extractFrame(ctx, o, i, t); err != nil {
 				errs[i] = err
 				cancel()
+			} else if o.OnFrame != nil {
+				o.OnFrame()
 			}
 		}()
 	}
@@ -125,7 +168,7 @@ func extractFrame(ctx context.Context, o FrameOptions, i int, t float64) error {
 	}
 	args := append(o.Decode.inputArgs(t, o.Input),
 		"-frames:v", "1", "-update", "1", "-q:v", "2", "-vf", vf, out)
-	err := runFFmpeg(ctx, o.FFmpeg, args...)
+	err := runFFmpegIn(ctx, o.WorkDir, o.FFmpeg, args...)
 	if ctx.Err() != nil {
 		return context.Canceled
 	}
@@ -154,7 +197,7 @@ func ExtractCover(ctx context.Context, ffmpeg, input string, at float64, out str
 		err = checkNonEmpty(out)
 	}
 	if err != nil {
-		return fmt.Errorf("cover at %s (%ss): %w", Clock(at), seconds(at), err)
+		return fmt.Errorf("cover at %s (%ss): %w", Timestamp(at), seconds(at), err)
 	}
 	return nil
 }
@@ -165,15 +208,14 @@ func ExtractCover(ctx context.Context, ffmpeg, input string, at float64, out str
 // to limited range; otherwise current FFmpeg writes yuvj420p. Odd
 // dimensions are rounded down to even values, which libx264 requires for
 // yuv420p.
-func EncodePreview(ctx context.Context, ffmpeg, workDir, out string, enc EncodePath) error {
-	if err := checkFilterPath(workDir); err != nil {
-		return err
-	}
+//
+// progress, when set, receives the number of frames encoded so far.
+func EncodePreview(ctx context.Context, ffmpeg, workDir, out string, enc EncodePath, progress func(frames int64)) error {
 	args := []string{"-framerate", "4", "-i", filepath.Join(workDir, FramePattern),
 		"-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2:out_range=tv,setsar=1"}
 	args = append(args, enc.codecArgs()...)
 	args = append(args, "-pix_fmt", "yuv420p", out)
-	err := runFFmpeg(ctx, ffmpeg, args...)
+	err := runFFmpegProgress(ctx, "", ffmpeg, progressInt("frame", progress), args...)
 	if err == nil {
 		err = checkNonEmpty(out)
 	}
@@ -182,24 +224,32 @@ func EncodePreview(ctx context.Context, ffmpeg, workDir, out string, enc EncodeP
 
 // MosaicOptions configures the mosaic image.
 type MosaicOptions struct {
-	FFmpeg   string
-	WorkDir  string
+	FFmpeg  string
+	WorkDir string
+	// FontFile and HeaderFile must be inside WorkDir with plain names; see
+	// FrameOptions.
 	FontFile string
 	// Aspect is the displayed width to height ratio of the source. Zero
 	// means 16:9.
 	Aspect float64
+	// Frames is the number of extracted frames, which sets the grid.
+	Frames int
 	// HeaderFile holds the header text, read without expansion.
 	HeaderFile string
 	Out        string
 }
 
-// MosaicCell returns the cell size for a displayed aspect ratio. The 10 by
-// 10 grid is the largest one with that aspect ratio that fits in 4K in the
-// video's orientation: 3840x2160 for landscape and square sources, 2160x3840
-// for portrait ones. The cell is therefore at most 384x216 or 216x384, with
-// the free side rounded to an even number: 16:9 gives 384x216, 9:16 gives
-// 216x384, 4:3 gives 288x216, 3:4 gives 216x288, and 1:1 gives 216x216. The
-// source resolution does not matter.
+// MosaicHeader is the height of the header above the grid, in pixels.
+const MosaicHeader = 40
+
+// MosaicCell returns the cell size of a 10 by 10 grid for a displayed aspect
+// ratio. That grid is the largest one with the aspect ratio that fits in 4K
+// in the video's orientation: 3840x2160 for landscape and square sources,
+// 2160x3840 for portrait ones. The cell is therefore at most 384x216 or
+// 216x384, with the free side rounded to an even number: 16:9 gives 384x216,
+// 9:16 gives 216x384, 4:3 gives 288x216, 3:4 gives 216x288, and 1:1 gives
+// 216x216. The source resolution does not matter. Ten times this cell is
+// the grid area for every frame count; see MosaicLayoutFor.
 func MosaicCell(aspect float64) (w, h int) {
 	if aspect <= 0 || math.IsNaN(aspect) || math.IsInf(aspect, 0) {
 		aspect = 16.0 / 9.0
@@ -215,6 +265,61 @@ func MosaicCell(aspect float64) (w, h int) {
 	return min(int(boxW), even(boxH*aspect)), int(boxH)
 }
 
+// MosaicGrid returns the grid for n frames: ceil(sqrt(n)) columns and
+// ceil(n / columns) rows, so 25 frames give 5x5, 98 give 10x10 with two
+// empty cells, and 7 give 3x3.
+func MosaicGrid(n int) (cols, rows int) {
+	n = max(1, n)
+	cols = int(math.Ceil(math.Sqrt(float64(n))))
+	// Guard against floating-point error for perfect squares.
+	for (cols-1)*(cols-1) >= n {
+		cols--
+	}
+	for cols*cols < n {
+		cols++
+	}
+	return cols, (n + cols - 1) / cols
+}
+
+// MosaicLayout describes where frames go in the mosaic grid.
+type MosaicLayout struct {
+	Cols, Rows int
+	// GridW and GridH are the grid area, ten times MosaicCell for every
+	// frame count, so the area keeps the displayed aspect ratio and the 4K
+	// limit.
+	GridW, GridH int
+	// CellW and CellH are the cell size: the grid area divided by the
+	// columns and rows, rounded down. Leftover pixels are split around the
+	// tiled cells as a black border.
+	CellW, CellH int
+	// ThumbW and ThumbH are the frame size inside a cell. The frame keeps
+	// its aspect ratio and is centered with black bars when the cell has
+	// another shape, as in a 3 by 2 grid.
+	ThumbW, ThumbH int
+}
+
+// MosaicLayoutFor returns the layout for a displayed aspect ratio and frame
+// count. Smaller grids get larger cells in the same area.
+func MosaicLayoutFor(aspect float64, frames int) MosaicLayout {
+	if aspect <= 0 || math.IsNaN(aspect) || math.IsInf(aspect, 0) {
+		aspect = 16.0 / 9.0
+	}
+	cw, ch := MosaicCell(aspect)
+	l := MosaicLayout{GridW: 10 * cw, GridH: 10 * ch}
+	l.Cols, l.Rows = MosaicGrid(frames)
+	l.CellW, l.CellH = l.GridW/l.Cols, l.GridH/l.Rows
+	// Fit the frame in the cell. A difference of up to 2 pixels from the
+	// cell is the even rounding of MosaicCell, so the frame fills the cell
+	// then, as in the 10 by 10 grid.
+	l.ThumbW, l.ThumbH = l.CellW, l.CellH
+	if w := int(math.Round(float64(l.CellH) * aspect)); w < l.CellW-2 {
+		l.ThumbW = w
+	} else if h := int(math.Round(float64(l.CellW) / aspect)); h < l.CellH-2 {
+		l.ThumbH = h
+	}
+	return l
+}
+
 // Overlay holds the timestamp overlay sizes, in pixels of the extracted
 // frame.
 type Overlay struct {
@@ -223,19 +328,22 @@ type Overlay struct {
 	Border   int
 }
 
-// Overlay sizes in mosaic pixels. They are the reference values (font 64,
-// margin 25, border 8) for a 1920x1080 frame shown in a 384x216 cell.
+// Overlay sizes in mosaic pixels for a 10 by 10 grid. They are the
+// reference values (font 64, margin 25, border 8) for a 1920x1080 frame
+// shown in a 384x216 cell.
 const (
 	overlayFontInCell   = 12.8
 	overlayMarginInCell = 5.0
 	overlayBorderInCell = 1.6
 )
 
-// OverlayFor sizes the timestamp overlay of a frame so that it has the same
-// size in the mosaic for every source resolution and aspect ratio. The frame
-// is frameWidth pixels wide at the displayed aspect ratio, and its mosaic
-// cell is MosaicCell(aspect). The preview video uses the same frames, so the
-// overlay keeps the same size relative to the picture there as well.
+// OverlayFor sizes the timestamp overlay of a frame from its width and
+// displayed aspect ratio only. The size is the one that shows as 12.8-pixel
+// text in a cell of the 10 by 10 grid, MosaicCell(aspect), for every source
+// resolution. It does not depend on the frame count: the preview video uses
+// the same frames, so its timestamps keep the same size relative to the
+// picture for every --frames value. Smaller grids have larger cells, so
+// their mosaic timestamps are larger than 12.8 pixels, never smaller.
 func OverlayFor(frameWidth int, aspect float64) Overlay {
 	cw, _ := MosaicCell(aspect)
 	scale := float64(frameWidth) / float64(cw)
@@ -250,36 +358,45 @@ func OverlayFor(frameWidth int, aspect float64) Overlay {
 }
 
 // MosaicSize returns the mosaic image size for a displayed aspect ratio:
-// the 10 by 10 grid, which fits in 4K, plus the 40-pixel header above it.
+// the grid area, which fits in 4K, plus the header above it. It is the same
+// for every frame count.
 func MosaicSize(aspect float64) (w, h int) {
-	cw, ch := MosaicCell(aspect)
-	return 10 * cw, 10*ch + 40
+	l := MosaicLayoutFor(aspect, 100)
+	return l.GridW, l.GridH + MosaicHeader
 }
 
-// BuildMosaic tiles the frames into a 10 by 10 grid whose aspect ratio
-// matches the displayed aspect ratio of the source, with empty cells left
-// black, then adds a 40-pixel header above the grid. Each frame is scaled
-// to its cell before tiling, which keeps the intermediate image small: a
-// grid of full-size 4K frames would exceed FFmpeg's image size limit.
+// BuildMosaic scales each frame to fit its cell, keeping its aspect ratio,
+// centers it in the cell on black, and tiles the cells into the grid of
+// MosaicLayoutFor. Empty cells stay black. It then centers the tiled cells
+// in the grid area and adds the header above it. Scaling before tiling
+// keeps the intermediate image small: a grid of full-size 4K frames would
+// exceed FFmpeg's image size limit.
 func BuildMosaic(ctx context.Context, o MosaicOptions) error {
-	for _, p := range []string{o.WorkDir, o.FontFile, o.HeaderFile} {
-		if err := checkFilterPath(p); err != nil {
-			return err
-		}
+	font, err := workFile(o.WorkDir, o.FontFile)
+	if err != nil {
+		return err
 	}
-	cw, ch := MosaicCell(o.Aspect)
+	header, err := workFile(o.WorkDir, o.HeaderFile)
+	if err != nil {
+		return err
+	}
+	l := MosaicLayoutFor(o.Aspect, o.Frames)
 	grid := filepath.Join(o.WorkDir, "grid.jpg")
 	if err := runFFmpeg(ctx, o.FFmpeg,
 		"-i", filepath.Join(o.WorkDir, FramePattern),
-		"-filter_complex", fmt.Sprintf("scale=%d:%d,setsar=1,", cw, ch)+
-			"tile=10x10:margin=0:padding=0",
+		"-filter_complex", fmt.Sprintf("scale=%d:%d,setsar=1,", l.ThumbW, l.ThumbH)+
+			fmt.Sprintf("pad=%d:%d:%d:%d:color=black,", l.CellW, l.CellH, (l.CellW-l.ThumbW)/2, (l.CellH-l.ThumbH)/2)+
+			fmt.Sprintf("tile=%dx%d:margin=0:padding=0", l.Cols, l.Rows),
 		"-frames:v", "1", "-update", "1", grid); err != nil {
 		return fmt.Errorf("tile frames: %w", err)
 	}
-	err := runFFmpeg(ctx, o.FFmpeg,
+	offX := (l.GridW - l.Cols*l.CellW) / 2
+	offY := (l.GridH - l.Rows*l.CellH) / 2
+	err = runFFmpegIn(ctx, o.WorkDir, o.FFmpeg,
 		"-i", grid,
-		"-filter_complex", "pad=iw:ih+40:0:40:color=black@1.0,"+
-			"drawtext=fontfile="+o.FontFile+":textfile="+o.HeaderFile+
+		"-filter_complex", fmt.Sprintf("pad=%d:%d:%d:%d:color=black@1.0,",
+			l.GridW, l.GridH+MosaicHeader, offX, MosaicHeader+offY)+
+			"drawtext=fontfile="+font+":textfile="+header+
 			":expansion=none:x=20:y=10:fontsize=24:fontcolor=white",
 		"-update", "1", o.Out)
 	if err == nil {
@@ -302,15 +419,31 @@ func checkNonEmpty(path string) error {
 	return nil
 }
 
-// checkFilterPath rejects paths that would need escaping inside an FFmpeg
-// filter graph. Only work directory paths and fixed file names are placed
-// in filters, so a failure points at an unusual temporary directory.
+// workFile returns the name of p relative to workDir, for use inside an
+// FFmpeg filter graph. FFmpeg runs with workDir as its current directory,
+// so filters never see an absolute path: Windows drive letters, backslashes,
+// and spaces in the temporary directory would otherwise need escaping.
+func workFile(workDir, p string) (string, error) {
+	rel, err := filepath.Rel(workDir, p)
+	if err != nil || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%s is not inside the work directory %s", p, workDir)
+	}
+	rel = filepath.ToSlash(rel)
+	if err := checkFilterPath(rel); err != nil {
+		return "", err
+	}
+	return rel, nil
+}
+
+// checkFilterPath rejects names that would need escaping inside an FFmpeg
+// filter graph. Only fixed file names inside the work directory are placed
+// in filters.
 func checkFilterPath(p string) error {
 	for _, r := range p {
 		ok := r == '/' || r == '.' || r == '_' || r == '-' ||
 			(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
 		if !ok {
-			return fmt.Errorf("path %q contains characters that FFmpeg filters cannot take safely; set TMPDIR to a plain directory", p)
+			return fmt.Errorf("file name %q contains characters that FFmpeg filters cannot take safely", p)
 		}
 	}
 	return nil

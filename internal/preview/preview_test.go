@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -95,6 +96,7 @@ type fixture struct {
 }
 
 func newFixture(t *testing.T) *fixture {
+	skipWithoutShell(t)
 	t.Helper()
 	tools := t.TempDir()
 	f := &fixture{dir: t.TempDir()}
@@ -104,7 +106,7 @@ func newFixture(t *testing.T) *fixture {
 	script := strings.Replace(fakeFFprobeScript, "SAMPLE_JSON", testdata("ffprobe", "sample.json"), 1)
 	must(t, os.WriteFile(f.ffprobe, []byte(script), 0o755))
 	must(t, os.WriteFile(f.ffmpeg, []byte(fakeFFmpegScript), 0o755))
-	must(t, os.WriteFile(f.font, []byte("font"), 0o644))
+	must(t, os.WriteFile(f.font, []byte("\x00\x01\x00\x00fake TrueType"), 0o644))
 	t.Setenv("FAKE_FASTSTART_SRC", testdata("video", "faststart.mp4"))
 	t.Setenv("FAKE_FFMPEG_FAIL", "")
 	t.Setenv("FAKE_FFMPEG_SLEEP", "")
@@ -236,14 +238,107 @@ func TestRunCreatesOutputs(t *testing.T) {
 	if res.Faststart != FaststartNotRequested || res.Frames != 5 || res.DurationSeconds != 2 {
 		t.Errorf("result = %+v", res)
 	}
-	// Two-second clip: the cover is the midpoint.
-	if res.CoverAtSeconds != 1 {
-		t.Errorf("cover at %v, want 1", res.CoverAtSeconds)
+	// Two-second clip at 10 fps: the random value 0.5 picks the middle of
+	// 0 to 1.9, the start of the last frame.
+	if res.CoverAtSeconds != 0.95 {
+		t.Errorf("cover at %v, want 0.95", res.CoverAtSeconds)
 	}
 	if hash(t, input) != before {
 		t.Error("the original changed")
 	}
 	assertClean(t, f.dir)
+}
+
+func coverAt(v float64) *float64 { return &v }
+
+func TestRunCoverAt(t *testing.T) {
+	cases := []struct {
+		name string
+		at   float64
+		ss   string
+	}{
+		{"zero", 0, "-ss 0.000 -i"},
+		{"fraction", 1.25, "-ss 1.250 -i"},
+		{"last frame", 1.9, "-ss 1.900 -i"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t)
+			input := f.copyInput(t, "sample.mp4", "clip.mp4")
+			opts := f.options(input)
+			opts.CoverAt = coverAt(c.at)
+			opts.Random = func() float64 { t.Error("random cover used with CoverAt"); return 0 }
+			var log bytes.Buffer
+			opts.Logf = func(format string, a ...any) { fmt.Fprintf(&log, format+"\n", a...) }
+			res, err := Run(context.Background(), opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.CoverAtSeconds != c.at {
+				t.Errorf("cover_at_seconds = %v, want %v", res.CoverAtSeconds, c.at)
+			}
+			if want := "generating cover at " + media.Timestamp(c.at) + " (--cover-at)"; !strings.Contains(log.String(), want) {
+				t.Errorf("log lacks %q:\n%s", want, log.String())
+			}
+
+			// The cover command seeks to exactly that time: make it fail on the
+			// expected -ss value.
+			input2 := f.copyInput(t, "sample.mp4", "clip2.mp4")
+			opts.Input = input2
+			// Frame extraction also seeks with -ss; only the cover puts -vf
+			// right after the input.
+			t.Setenv("FAKE_FFMPEG_FAIL", c.ss+" file:"+input2+" -vf")
+			if _, err := Run(context.Background(), opts); err == nil || stepOf(t, err) != StepCover {
+				t.Errorf("cover command did not use %q: %v", c.ss, err)
+			}
+		})
+	}
+}
+
+func TestRunRejectsCoverOutsideVideo(t *testing.T) {
+	cases := map[string]float64{"past the last frame": 1.95, "past the end": 2, "far past": 3600, "negative": -1}
+	for name, at := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			input := f.copyInput(t, "sample.mp4", "clip.mp4")
+			opts := f.options(input)
+			opts.CoverAt = coverAt(at)
+			_, err := Run(context.Background(), opts)
+			if err == nil || stepOf(t, err) != StepValidateOptions {
+				t.Fatalf("err = %v", err)
+			}
+			if at >= 0 && !strings.Contains(err.Error(), "last frame starts at 00:00:01.900") {
+				t.Errorf("error does not give the valid range: %v", err)
+			}
+			if f.mpegs.Load() != 0 {
+				t.Error("ffmpeg was resolved before the cover time was checked")
+			}
+			assertNoOutputs(t, input)
+			assertClean(t, f.dir)
+		})
+	}
+}
+
+func TestRunMosaicGridFollowsFrames(t *testing.T) {
+	cases := map[int]string{1: "tile=1x1:", 5: "tile=3x2:", 25: "tile=5x5:", 98: "tile=10x10:", 100: "tile=10x10:"}
+	for frames, marker := range cases {
+		t.Run(fmt.Sprint(frames), func(t *testing.T) {
+			f := newFixture(t)
+			input := f.copyInput(t, "sample.mp4", "clip.mp4")
+			opts := f.options(input)
+			opts.Frames = frames
+			res, err := Run(context.Background(), opts)
+			if err != nil || res.Frames != frames {
+				t.Fatalf("res = %+v, err = %v", res, err)
+			}
+			input2 := f.copyInput(t, "sample.mp4", "clip2.mp4")
+			opts.Input = input2
+			t.Setenv("FAKE_FFMPEG_FAIL", marker)
+			if _, err := Run(context.Background(), opts); err == nil || stepOf(t, err) != StepMosaic {
+				t.Errorf("mosaic did not use %q: %v", marker, err)
+			}
+		})
+	}
 }
 
 func TestRunRejectsBadFrameCounts(t *testing.T) {
@@ -326,7 +421,7 @@ func TestRunProcessingFailurePreservesEverything(t *testing.T) {
 		"frame_003.jpg":        StepExtractFrames,
 		"setsar=1 -frames:v 1": StepCover,
 		"libx264":              StepPreviewVideo,
-		"tile=10x10":           StepMosaic,
+		"tile=":                StepMosaic,
 	}
 	for marker, step := range steps {
 		for _, overwrite := range []bool{false, true} {
@@ -529,7 +624,7 @@ func TestRunFaststartAlreadyApplied(t *testing.T) {
 func TestRunFaststartFailures(t *testing.T) {
 	cases := map[string]string{
 		"+faststart": StepFaststart,
-		"tile=10x10": StepMosaic,
+		"tile=":      StepMosaic,
 		"libx264":    StepPreviewVideo,
 	}
 	for marker, step := range cases {
@@ -877,4 +972,105 @@ func TestAccelEncodeChoiceAndFallback(t *testing.T) {
 			}
 		})
 	}
+}
+
+// skipWithoutShell skips tests whose fake FFmpeg and FFprobe are shell
+// scripts, which Windows cannot run. Windows is covered by the integration
+// tests with real tools and by the manual procedure in the README.
+func skipWithoutShell(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake tools are shell scripts")
+	}
+}
+
+type recordedProgress struct {
+	mu     sync.Mutex
+	events []string
+	max    map[string]int64
+	label  string
+}
+
+func (p *recordedProgress) Start(label string, total int64, unit string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.label = label
+	p.events = append(p.events, fmt.Sprintf("start %s %d %s", label, total, unit))
+}
+
+func (p *recordedProgress) Set(done int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.max == nil {
+		p.max = map[string]int64{}
+	}
+	p.max[p.label] = max(p.max[p.label], done)
+}
+
+func (p *recordedProgress) Done() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.events = append(p.events, "done "+p.label)
+}
+
+// Every step without log output reports progress, and each Start is ended.
+func TestProgressCoversSilentSteps(t *testing.T) {
+	f := newFixture(t)
+	opts := f.options(f.copyInput(t, "sample.mp4", "clip.mp4"))
+	rec := &recordedProgress{}
+	opts.Progress = rec
+	if _, err := Run(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"start choosing the frame decoder 0 ", "done choosing the frame decoder",
+		"start extracting frames 5 frames", "done extracting frames",
+		"start generating cover 0 ", "done generating cover",
+		"start choosing the preview encoder 0 ", "done choosing the preview encoder",
+		"start encoding preview video 5 frames", "done encoding preview video",
+		"start building mosaic 0 ", "done building mosaic",
+	}
+	if strings.Join(rec.events, "\n") != strings.Join(want, "\n") {
+		t.Errorf("events:\n%s\nwant:\n%s", strings.Join(rec.events, "\n"), strings.Join(want, "\n"))
+	}
+	if rec.max["extracting frames"] != 5 {
+		t.Errorf("frames reported = %d, want 5", rec.max["extracting frames"])
+	}
+}
+
+// A failing step still ends its progress display.
+func TestProgressEndsOnFailure(t *testing.T) {
+	f := newFixture(t)
+	t.Setenv("FAKE_FFMPEG_FAIL", "tile=")
+	opts := f.options(f.copyInput(t, "sample.mp4", "clip.mp4"))
+	rec := &recordedProgress{}
+	opts.Progress = rec
+	if _, err := Run(context.Background(), opts); err == nil {
+		t.Fatal("expected a mosaic failure")
+	}
+	if last := rec.events[len(rec.events)-1]; last != "done building mosaic" {
+		t.Errorf("last event %q", last)
+	}
+}
+
+// A bad --font fails before any tool is resolved and leaves nothing behind.
+func TestInvalidFontFailsFirst(t *testing.T) {
+	f := newFixture(t)
+	input := f.copyInput(t, "sample.mp4", "clip.mp4")
+	notFont := filepath.Join(t.TempDir(), "notes.ttf")
+	must(t, os.WriteFile(notFont, []byte("hello"), 0o644))
+	for _, font := range []string{filepath.Join(t.TempDir(), "missing.ttf"), notFont} {
+		opts := f.options(input)
+		opts.Font = font
+		_, err := Run(context.Background(), opts)
+		var se *StepError
+		if !errors.As(err, &se) || se.Step != StepFindFont || !strings.Contains(err.Error(), font) {
+			t.Fatalf("err = %v, want a %s error naming %s", err, StepFindFont, font)
+		}
+	}
+	if f.probes.Load() != 0 || f.mpegs.Load() != 0 {
+		t.Errorf("tools resolved: ffprobe %d, ffmpeg %d", f.probes.Load(), f.mpegs.Load())
+	}
+	assertNoOutputs(t, input)
+	assertClean(t, f.dir)
 }

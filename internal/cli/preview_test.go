@@ -29,6 +29,7 @@ type previewFixture struct {
 
 func newPreviewFixture(t *testing.T) previewFixture {
 	t.Helper()
+	skipWithoutShell(t)
 	dir := t.TempDir()
 	data, err := os.ReadFile(testdata("video", "sample.mp4"))
 	if err != nil {
@@ -44,7 +45,7 @@ func newPreviewFixture(t *testing.T) previewFixture {
 	if err := os.WriteFile(ffmpeg, []byte(fakeFFmpegForCLI), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(font, []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(font, []byte("\x00\x01\x00\x00fake TrueType"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return previewFixture{
@@ -55,11 +56,11 @@ func newPreviewFixture(t *testing.T) previewFixture {
 
 func TestPreviewText(t *testing.T) {
 	f := newPreviewFixture(t)
-	r := run(t, nil, append(f.args, f.input)...)
+	r := run(t, nil, append(f.args, "--cover-at", "00:00:01.250", f.input)...)
 	if r.err != nil {
 		t.Fatalf("%v\nstderr:\n%s", r.err, r.stderr)
 	}
-	for _, want := range []string{"clip_cover.jpg (at 00:00:01)", "clip_preview.mp4 (3 frames at 4 fps)", "clip_preview.jpg", "not requested, original unchanged"} {
+	for _, want := range []string{"clip_cover.jpg (at 00:00:01.250)", "clip_preview.mp4 (3 frames at 4 fps)", "clip_preview.jpg", "not requested, original unchanged"} {
 		if !strings.Contains(r.stdout, want) {
 			t.Errorf("stdout lacks %q:\n%s", want, r.stdout)
 		}
@@ -116,6 +117,49 @@ func TestPreviewRejectsFrameCounts(t *testing.T) {
 		args := append(append([]string{}, f.args...), "--frames", n, f.input)
 		if r := run(t, nil, args...); r.err == nil || !strings.Contains(r.err.Error(), "frames must be between 1 and 100") {
 			t.Errorf("--frames %s: err = %v", n, r.err)
+		}
+	}
+}
+
+func TestPreviewCoverAt(t *testing.T) {
+	f := newPreviewFixture(t)
+	for _, c := range []struct {
+		arg  string
+		want float64
+	}{{"00:00:00", 0}, {"00:00:01.5", 1.5}} {
+		r := run(t, nil, append(f.args, "--overwrite", "--json", "--cover-at", c.arg, f.input)...)
+		if r.err != nil {
+			t.Fatalf("--cover-at %s: %v\nstderr:\n%s", c.arg, r.err, r.stderr)
+		}
+		var doc struct {
+			CoverAt *float64 `json:"cover_at_seconds"`
+		}
+		if err := json.Unmarshal([]byte(r.stdout), &doc); err != nil || doc.CoverAt == nil || *doc.CoverAt != c.want {
+			t.Errorf("--cover-at %s: cover_at_seconds in %s, want %v", c.arg, r.stdout, c.want)
+		}
+	}
+}
+
+func TestPreviewRejectsCoverAt(t *testing.T) {
+	f := newPreviewFixture(t)
+	cases := map[string]string{
+		"":             "--cover-at: timestamp \"\" is not in HH:MM:SS",
+		"75":           "--cover-at: timestamp \"75\" is not in HH:MM:SS",
+		"00:01":        "is not in HH:MM:SS",
+		"00:00:61":     "60 or more",
+		"-00:00:01":    "is negative",
+		"00:00:02":     "cover time 00:00:02 is outside the video: the last frame starts at 00:00:01.900",
+		"10:00:00.500": "cover time 10:00:00.500 is outside the video",
+	}
+	for arg, want := range cases {
+		r := run(t, nil, append(f.args, "--cover-at="+arg, f.input)...)
+		if r.err == nil || !strings.Contains(r.err.Error(), want) {
+			t.Errorf("--cover-at %q: err = %v, want %q", arg, r.err, want)
+		}
+		for _, s := range []string{"_cover.jpg", "_preview.mp4", "_preview.jpg"} {
+			if _, err := os.Stat(strings.TrimSuffix(f.input, ".mp4") + s); err == nil {
+				t.Fatalf("--cover-at %q: output %s was created", arg, s)
+			}
 		}
 	}
 }

@@ -113,7 +113,9 @@ func TestIntegrationManagedFFprobe(t *testing.T) {
 		if r.err != nil {
 			t.Fatal(r.err)
 		}
-		if r.stderr != "" {
+		// stderr only reports the cached managed build that was chosen.
+		if !strings.HasPrefix(r.stderr, "using ffprobe ") || !strings.Contains(r.stderr, "(managed ") ||
+			strings.Count(r.stderr, "\n") != 1 || strings.Contains(r.stderr, "download") {
 			t.Errorf("unexpected stderr on a cached run:\n%s", r.stderr)
 		}
 	})
@@ -341,7 +343,8 @@ func TestIntegrationPreview(t *testing.T) {
 		if got := streamHash(t, ffmpeg, in); got != hashBefore {
 			t.Errorf("streams changed:\nbefore %s\nafter  %s", hashBefore, got)
 		}
-		if fi, _ := os.Stat(in); fi.Mode().Perm() != 0o640 {
+		// Windows keeps only a read-only flag, not Unix permission bits.
+		if fi, _ := os.Stat(in); runtime.GOOS != "windows" && fi.Mode().Perm() != 0o640 {
 			t.Errorf("mode = %v, want 0640", fi.Mode().Perm())
 		}
 	})
@@ -430,8 +433,11 @@ func TestIntegrationPreviewAspect(t *testing.T) {
 		{"4K_9x16_phone", 2160, 3840, "1/1", 0, 9, 16, 2160, 3840, "top"},
 	}
 	// darkArea holds, per case, the dark pixels of the timestamp box in the
-	// first mosaic cell; it must not depend on resolution or aspect ratio.
+	// first mosaic frame; it must not depend on resolution or aspect ratio.
 	darkArea := map[string]int{}
+	// upscale holds, per case, how much the frame is enlarged in the mosaic;
+	// values below 1 mean it is reduced.
+	upscale := map[string]float64{}
 	dir := t.TempDir()
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -538,11 +544,13 @@ func TestIntegrationPreviewAspect(t *testing.T) {
 						t.Errorf("mosaic %dx%d (grid aspect %.4f), want %dx%d (aspect %.4f)", mosaic.Width, mosaic.Height, gridAspect, wantW, wantH, aspect)
 					}
 
-					cw, ch := media.MosaicCell(aspect)
+					// Ten frames give a 4 by 3 grid whose cells are wider or taller
+					// than the frame, so this also checks the centering in the cell.
+					tx, ty, tw, th := firstThumb(aspect, 10)
 					sides := map[string]string{
 						"cover":       whiteSide(t, ffmpeg, base+"_cover.jpg", 0, 0, cover.Width, cover.Height),
 						"preview":     whiteSide(t, ffmpeg, base+"_preview.mp4", 0, 0, video.Width, video.Height),
-						"mosaic cell": whiteSide(t, ffmpeg, base+"_preview.jpg", 0, 40, cw, ch),
+						"mosaic cell": whiteSide(t, ffmpeg, base+"_preview.jpg", tx, ty, tw, th),
 					}
 					for what, side := range sides {
 						if side != c.side {
@@ -551,7 +559,10 @@ func TestIntegrationPreviewAspect(t *testing.T) {
 					}
 					// The measured region is all white only when the white half is on top.
 					if c.side == "top" {
-						darkArea[c.name+"/"+mode] = overlayDarkArea(t, ffmpeg, base+"_preview.jpg", 0, 40)
+						cw, _ := media.MosaicCell(aspect)
+						scale := float64(tw) / float64(cw)
+						darkArea[c.name+"/"+mode] = overlayDarkArea(t, ffmpeg, base+"_preview.jpg", tx, ty, scale)
+						upscale[c.name+"/"+mode] = float64(tw) / float64(c.dispW)
 					}
 					t.Logf("%s, decoder %s, encoder %s: source %dx%d SAR %s rotation %d (clockwise %d) -> display %dx%d (%d:%d); cover %dx%d; preview %dx%d SAR %s DAR %s (%.4f, want %.4f) rotation %d; mosaic %dx%d, grid %dx%d; white side %s",
 						mode, res.FrameDecoder, res.PreviewEncoder, c.w, c.h, strings.Replace(c.sar, "/", ":", 1), c.rotation, srcInfo.Video.Rotation, c.dispW, c.dispH, c.aspectW, c.aspectH,
@@ -567,10 +578,202 @@ func TestIntegrationPreviewAspect(t *testing.T) {
 	}
 	for name, area := range darkArea {
 		t.Logf("overlay dark area in the first mosaic cell: %s %d px (16x9/cpu: %d px)", name, area, ref)
-		if math.Abs(float64(area)/float64(ref)-1) > 0.2 {
-			t.Errorf("%s: overlay dark area %d px differs from 16x9/cpu (%d px) by more than 20%%", name, area, ref)
+		// The overlay is drawn in whole frame pixels. A frame narrower than
+		// its cell is enlarged into the mosaic, so rounding, mostly of the
+		// box border, is enlarged too; the measured area then depends more
+		// on the font's rendering at small sizes.
+		// With 10 frames the 320x180 case is enlarged 3 times: its 11-pixel
+		// font and 1-pixel box border (1.33 would be exact) are enlarged with
+		// it, and it measures about 34 percent below the reference, against
+		// 23 percent at the 1.2 times of the 10 by 10 grid.
+		limit := 0.2
+		switch {
+		case upscale[name] > 2:
+			limit = 0.4
+		case upscale[name] > 1:
+			limit = 0.3
+		}
+		if math.Abs(float64(area)/float64(ref)-1) > limit {
+			t.Errorf("%s: overlay dark area %d px differs from 16x9/cpu (%d px) by more than %.0f%%", name, area, ref, limit*100)
 		}
 	}
+}
+
+// TestIntegrationMosaicGrid checks the grid for 1, 25, 98, and 100 frames
+// on a landscape and a portrait video: the mosaic keeps its size, empty
+// cells are black, the MP4 keeps the requested frame count, and its
+// timestamps keep the same size, while the mosaic timestamps grow with the
+// cells.
+func TestIntegrationMosaicGrid(t *testing.T) {
+	ffmpeg, ffprobe := managedTools(t)
+	cache := testCache(t)
+	dir := t.TempDir()
+	for _, c := range []struct {
+		name   string
+		w, h   int
+		aspect float64
+	}{{"landscape", 1280, 720, 16.0 / 9}, {"portrait", 720, 1280, 9.0 / 16}} {
+		t.Run(c.name, func(t *testing.T) {
+			// A bright moving pattern, so filled cells are never black.
+			src := filepath.Join(dir, c.name+".mp4")
+			gen := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+				"-f", "lavfi", "-i", fmt.Sprintf("testsrc2=size=%dx%d:rate=25:duration=12", c.w, c.h),
+				"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", src)
+			if out, err := gen.CombinedOutput(); err != nil {
+				t.Fatalf("generate: %v\n%s", err, out)
+			}
+			wantW, wantH := media.MosaicSize(c.aspect)
+			cw, _ := media.MosaicCell(c.aspect)
+			mosaicArea := map[int]float64{}
+			videoArea := map[int]int{}
+			for _, n := range []int{1, 25, 98, 100} {
+				in := filepath.Join(dir, fmt.Sprintf("%s_%d.mp4", c.name, n))
+				data, err := os.ReadFile(src)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(in, data, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				r := runReal(t, cache, "preview", "--accel", "cpu", "--frames", strconv.Itoa(n), in)
+				if r.err != nil {
+					t.Fatalf("%d frames: %v\nstderr:\n%s", n, r.err, r.stderr)
+				}
+				base := strings.TrimSuffix(in, ".mp4")
+				l := media.MosaicLayoutFor(c.aspect, n)
+				if !strings.Contains(r.stderr, fmt.Sprintf("building mosaic: %dx%d grid", l.Cols, l.Rows)) {
+					t.Errorf("%d frames: stderr does not report the %dx%d grid:\n%s", n, l.Cols, l.Rows, r.stderr)
+				}
+				mosaic := probeFirstStream(t, ffprobe, base+"_preview.jpg")
+				if mosaic.Width != wantW || mosaic.Height != wantH {
+					t.Errorf("%d frames: mosaic %dx%d, want %dx%d", n, mosaic.Width, mosaic.Height, wantW, wantH)
+				}
+				video := probeFirstStream(t, ffprobe, base+"_preview.mp4")
+				if video.NbFrames != strconv.Itoa(n) || video.Width != c.w || video.Height != c.h {
+					t.Errorf("%d frames: preview has %s frames at %dx%d, want %d at %dx%d", n, video.NbFrames, video.Width, video.Height, n, c.w, c.h)
+				}
+				// Every frame is in its cell, and the cells after the last frame
+				// are black.
+				// Check the first and last filled cells and every empty one.
+				for i := range l.Cols * l.Rows {
+					if i >= 2 && i < n-2 {
+						continue
+					}
+					col, row := i%l.Cols, i/l.Cols
+					x := (l.GridW-l.Cols*l.CellW)/2 + col*l.CellW + (l.CellW-l.ThumbW)/2
+					y := media.MosaicHeader + (l.GridH-l.Rows*l.CellH)/2 + row*l.CellH + (l.CellH-l.ThumbH)/2
+					// Measure the lower right part, away from the timestamp.
+					luma := meanLuma(t, ffmpeg, base+"_preview.jpg", x+l.ThumbW/2, y+l.ThumbH/2, l.ThumbW/3, l.ThumbH/3)
+					if i < n && luma < 40 || i >= n && luma > 4 {
+						t.Errorf("%d frames: cell %d (column %d, row %d) has mean luma %.1f", n, i+1, col+1, row+1, luma)
+					}
+				}
+				x, y, tw, _ := firstThumb(c.aspect, n)
+				scale := float64(tw) / float64(cw)
+				mosaicArea[n] = float64(overlayDarkArea(t, ffmpeg, base+"_preview.jpg", x, y, scale)) / (scale * scale)
+				ov := media.OverlayFor(c.w, c.aspect)
+				videoArea[n] = overlayDarkArea(t, ffmpeg, base+"_preview.mp4", 0, 0, float64(ov.FontSize)/12.8)
+				t.Logf("%d frames: grid %dx%d, cells %dx%d, frames %dx%d in the mosaic; mosaic font about %.1f px; MP4 overlay dark area %d px",
+					n, l.Cols, l.Rows, l.CellW, l.CellH, l.ThumbW, l.ThumbH, 12.8*scale, videoArea[n])
+			}
+			// The MP4 timestamp does not depend on the frame count.
+			for n, a := range videoArea {
+				if math.Abs(float64(a)/float64(videoArea[100])-1) > 0.02 {
+					t.Errorf("%d frames: MP4 overlay dark area %d px, %d px with 100 frames", n, a, videoArea[100])
+				}
+			}
+			// In the mosaic the timestamp scales with the frame, so its area
+			// divided by the squared scale stays about the same.
+			for n, a := range mosaicArea {
+				if math.Abs(a/mosaicArea[100]-1) > 0.25 {
+					t.Errorf("%d frames: normalized mosaic overlay area %.0f, %.0f with 100 frames", n, a, mosaicArea[100])
+				}
+			}
+		})
+	}
+}
+
+// TestIntegrationCoverAt checks --cover-at on a video whose brightness
+// rises with time, so the cover shows which frame was taken.
+func TestIntegrationCoverAt(t *testing.T) {
+	ffmpeg, ffprobe := managedTools(t)
+	cache := testCache(t)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "ramp.mp4")
+	gen := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "nullsrc=size=320x180:rate=10:duration=4,geq=lum='min(235,16+T*50)':cb=128:cr=128",
+		"-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-pix_fmt", "yuv420p", src)
+	if out, err := gen.CombinedOutput(); err != nil {
+		t.Fatalf("generate: %v\n%s", err, out)
+	}
+	info, err := media.Inspect(t.Context(), ffprobe, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := info.LastFrameTime()
+	for i, c := range []struct {
+		arg  string
+		want float64
+	}{{"00:00:00", 0}, {"00:00:01.250", 1.25}, {media.Timestamp(math.Floor(last*1000) / 1000), math.Floor(last*1000) / 1000}} {
+		in := filepath.Join(dir, fmt.Sprintf("ramp_%d.mp4", i))
+		data, _ := os.ReadFile(src)
+		if err := os.WriteFile(in, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		r := runReal(t, cache, "preview", "--frames", "4", "--json", "--cover-at", c.arg, in)
+		if r.err != nil {
+			t.Fatalf("--cover-at %s: %v\nstderr:\n%s", c.arg, r.err, r.stderr)
+		}
+		var res struct {
+			CoverAt float64 `json:"cover_at_seconds"`
+		}
+		if err := json.Unmarshal([]byte(r.stdout), &res); err != nil || res.CoverAt != c.want {
+			t.Errorf("--cover-at %s: cover_at_seconds in %s, want %v", c.arg, r.stdout, c.want)
+		}
+		// The frame shown at time T has a limited-range luma of 16 + 50 T.
+		// The JPEG cover is full range, so that becomes 50 T * 255 / 219,
+		// checked within about one frame (0.1 s, 5.8 levels) plus JPEG error.
+		cover := strings.TrimSuffix(in, ".mp4") + "_cover.jpg"
+		got := meanLuma(t, ffmpeg, cover, 0, 0, 320, 180)
+		want := 50 * c.want * 255 / 219
+		if math.Abs(got-want) > 8 {
+			t.Errorf("--cover-at %s: cover luma %.1f, want about %.1f", c.arg, got, want)
+		}
+		t.Logf("--cover-at %s: cover_at_seconds %v, cover luma %.1f (expected %.1f)", c.arg, res.CoverAt, got, want)
+	}
+	for _, arg := range []string{"00:00:04", "00:00:03.999", "01:00:00"} {
+		in := filepath.Join(dir, "ramp_out.mp4")
+		data, _ := os.ReadFile(src)
+		if err := os.WriteFile(in, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		r := runReal(t, cache, "preview", "--cover-at", arg, in)
+		if r.err == nil || !strings.Contains(r.err.Error(), "is outside the video") {
+			t.Errorf("--cover-at %s: err = %v", arg, r.err)
+		}
+		if _, err := os.Stat(strings.TrimSuffix(in, ".mp4") + "_cover.jpg"); err == nil {
+			t.Errorf("--cover-at %s: a cover was written", arg)
+		}
+	}
+}
+
+// managedTools returns the managed ffmpeg and ffprobe from the test cache.
+func managedTools(t *testing.T) (ffmpeg, ffprobe string) {
+	t.Helper()
+	root, _ := tools.DefaultCacheRoot(testCache(t))
+	var paths [2]string
+	for i, tool := range []string{tools.ToolFFmpeg, tools.ToolFFprobe} {
+		a, err := tools.LookupArtifact(tool, runtime.GOOS, runtime.GOARCH)
+		if err != nil {
+			t.Skip(err)
+		}
+		p, err := (&tools.Manager{Root: root, Artifact: a}).Ensure(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		paths[i] = p
+	}
+	return paths[0], paths[1]
 }
 
 // parseRatio reads an FFprobe ratio such as "16:9".
@@ -590,10 +793,23 @@ func parseRatio(s string) (float64, bool) {
 // overlayDarkArea counts dark pixels in the 120x30 region at the top-left of
 // a mosaic cell. On a white source that region holds the timestamp box, so
 // the count follows the overlay size in the mosaic.
-func overlayDarkArea(t *testing.T, ffmpeg, p string, x, y int) int {
+// firstThumb returns the position and size of the first frame in a mosaic,
+// below the header.
+func firstThumb(aspect float64, frames int) (x, y, w, h int) {
+	l := media.MosaicLayoutFor(aspect, frames)
+	x = (l.GridW-l.Cols*l.CellW)/2 + (l.CellW-l.ThumbW)/2
+	y = media.MosaicHeader + (l.GridH-l.Rows*l.CellH)/2 + (l.CellH-l.ThumbH)/2
+	return x, y, l.ThumbW, l.ThumbH
+}
+
+// overlayDarkArea counts the dark pixels of the timestamp box in the
+// region of 120x30 pixels times scale at x, y. Scale is the size of the
+// frame in the mosaic relative to a cell of the 10 by 10 grid.
+func overlayDarkArea(t *testing.T, ffmpeg, p string, x, y int, scale float64) int {
 	t.Helper()
+	w, h := int(math.Round(120*scale)), int(math.Round(30*scale))
 	out, err := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-i", p,
-		"-vf", fmt.Sprintf("crop=120:30:%d:%d,format=gray", x, y),
+		"-vf", fmt.Sprintf("crop=%d:%d:%d:%d,format=gray", w, h, x, y),
 		"-frames:v", "1", "-f", "rawvideo", "-").Output()
 	if err != nil {
 		t.Fatalf("read overlay region of %s: %v", p, err)
