@@ -1,0 +1,608 @@
+//go:build integration
+
+// The integration tests run the real managed FFmpeg and FFprobe. Run them
+// separately from the default suite:
+//
+//	go test -tags integration -count=1 -v ./internal/cli/
+//
+// They use the regular musafoz cache, or MUSAFOZ_TEST_CACHE_DIR, so the
+// builds are downloaded at most once per machine. Set MUSAFOZ_TEST_DOWNLOAD=1
+// to also test downloading into an empty cache; the vendor rate-limits
+// repeated downloads, so do this sparingly.
+//
+// Optionally set MUSAFOZ_TEST_VIDEO to a local video and
+// MUSAFOZ_REFERENCE_FFPROBE to a reference ffprobe to compare durations.
+package cli
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/fabiotnt/musafoz/internal/media"
+	"github.com/fabiotnt/musafoz/internal/tools"
+)
+
+type failingTransport struct{}
+
+func (failingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("network disabled in test")
+}
+
+// TestIntegrationDownload installs both managed builds into an empty cache.
+// It only runs with MUSAFOZ_TEST_DOWNLOAD=1.
+func TestIntegrationDownload(t *testing.T) {
+	if os.Getenv("MUSAFOZ_TEST_DOWNLOAD") != "1" {
+		t.Skip("set MUSAFOZ_TEST_DOWNLOAD=1 to download into an empty cache")
+	}
+	cache := t.TempDir()
+	probe, err := tools.LookupArtifact(tools.ToolFFprobe, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Skip(err)
+	}
+	mpeg, _ := tools.LookupArtifact(tools.ToolFFmpeg, runtime.GOOS, runtime.GOARCH)
+
+	t.Run("first runs download each build once", func(t *testing.T) {
+		r := runReal(t, cache, "inspect", "--json", testdata("video", "sample.mp4"))
+		if r.err != nil {
+			t.Fatalf("%v\nstderr:\n%s", r.err, r.stderr)
+		}
+		if !strings.Contains(r.stderr, "downloading ffprobe "+probe.Version) {
+			t.Errorf("stderr lacks the ffprobe download:\n%s", r.stderr)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(r.stdout), &doc); err != nil {
+			t.Fatalf("stdout is not pure JSON: %v\n%s", err, r.stdout)
+		}
+		in := copyVideo(t, t.TempDir(), "sample.mp4", "clip.mp4")
+		r = runReal(t, cache, "preview", "--frames", "5", in)
+		if r.err != nil {
+			t.Fatalf("%v\nstderr:\n%s", r.err, r.stderr)
+		}
+		if !strings.Contains(r.stderr, "downloading ffmpeg "+mpeg.Version) || strings.Contains(r.stderr, "downloading ffprobe") {
+			t.Errorf("want exactly one ffmpeg download:\n%s", r.stderr)
+		}
+	})
+
+	t.Run("later runs reuse the cache without network", func(t *testing.T) {
+		root, _ := tools.DefaultCacheRoot(cache)
+		for _, a := range []tools.Artifact{probe, mpeg} {
+			m := &tools.Manager{Root: root, Artifact: a, Client: &http.Client{Transport: failingTransport{}}}
+			if _, err := m.Ensure(context.Background()); err != nil {
+				t.Fatalf("%s: %v", a.Tool, err)
+			}
+		}
+	})
+}
+
+func TestIntegrationManagedFFprobe(t *testing.T) {
+	cache := testCache(t)
+	artifact, err := tools.FFprobeArtifact(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Skip(err)
+	}
+
+	t.Run("inspect with the managed build", func(t *testing.T) {
+		r := runReal(t, cache, "inspect", "--json", testdata("video", "sample.mp4"))
+		if r.err != nil {
+			t.Fatalf("%v\nstderr:\n%s", r.err, r.stderr)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(r.stdout), &doc); err != nil {
+			t.Fatalf("stdout is not pure JSON: %v\n%s", err, r.stdout)
+		}
+		if doc["duration_seconds"] != 2.0 || doc["video"].(map[string]any)["codec"] != "h264" {
+			t.Errorf("unexpected result: %s", r.stdout)
+		}
+	})
+
+	t.Run("cached run downloads nothing", func(t *testing.T) {
+		r := runReal(t, cache, "inspect", testdata("video", "sample.mp4"))
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if r.stderr != "" {
+			t.Errorf("unexpected stderr on a cached run:\n%s", r.stderr)
+		}
+	})
+
+	t.Run("cache works without network", func(t *testing.T) {
+		root, _ := tools.DefaultCacheRoot(cache)
+		m := &tools.Manager{Root: root, Artifact: artifact, Client: &http.Client{Transport: failingTransport{}}}
+		if _, err := m.Ensure(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("real edge cases", func(t *testing.T) {
+		fails := map[string]string{
+			"corrupt.mp4":    "ffprobe could not read the file",
+			"audio_only.m4a": "no video stream found",
+			"cover_art.mp3":  "no video stream found",
+			"still.png":      "no video stream found",
+		}
+		for name, want := range fails {
+			r := runReal(t, cache, "inspect", testdata("video", name))
+			if r.err == nil || !strings.Contains(r.err.Error(), want) || !strings.Contains(r.err.Error(), name) {
+				t.Errorf("%s: err = %v, want %q", name, r.err, want)
+			}
+		}
+		r := runReal(t, cache, "inspect", testdata("video", "raw.h264"))
+		if r.err != nil || !strings.Contains(r.stdout, "Duration:   unknown") || !strings.Contains(r.stderr, "warning:") {
+			t.Errorf("raw.h264: err = %v\nstdout:\n%s\nstderr:\n%s", r.err, r.stdout, r.stderr)
+		}
+		r = runReal(t, cache, "inspect", testdata("video", "rotated.mp4"))
+		if r.err != nil || !strings.Contains(r.stdout, "Display:    240x320") {
+			t.Errorf("rotated.mp4: err = %v\nstdout:\n%s", r.err, r.stdout)
+		}
+	})
+
+	t.Run("duration matches the reference ffprobe", func(t *testing.T) {
+		video, ref := os.Getenv("MUSAFOZ_TEST_VIDEO"), os.Getenv("MUSAFOZ_REFERENCE_FFPROBE")
+		if video == "" || ref == "" {
+			t.Skip("set MUSAFOZ_TEST_VIDEO and MUSAFOZ_REFERENCE_FFPROBE to compare")
+		}
+		// Same duration query as the reference preview workflow.
+		out, err := exec.Command(ref, "-v", "error", "-show_entries", "format=duration",
+			"-of", "default=noprint_wrappers=1:nokey=1", video).Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+		if err != nil {
+			t.Fatalf("reference duration %q: %v", out, err)
+		}
+		r := runReal(t, cache, "inspect", "--json", video)
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		var doc struct {
+			Duration *float64 `json:"duration_seconds"`
+		}
+		if err := json.Unmarshal([]byte(r.stdout), &doc); err != nil || doc.Duration == nil {
+			t.Fatalf("no duration in %s (%v)", r.stdout, err)
+		}
+		if math.Abs(*doc.Duration-want) > 1e-6 {
+			t.Errorf("duration = %f, reference = %f", *doc.Duration, want)
+		}
+		t.Logf("duration %f matches reference %f", *doc.Duration, want)
+	})
+}
+
+func copyVideo(t *testing.T, dir, src, name string) string {
+	t.Helper()
+	data, err := os.ReadFile(testdata("video", src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, data, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func sha(t *testing.T, p string) string {
+	t.Helper()
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := sha256.Sum256(data)
+	return hex.EncodeToString(s[:])
+}
+
+func TestIntegrationPreview(t *testing.T) {
+	cache := testCache(t)
+	root, _ := tools.DefaultCacheRoot(cache)
+	probeArt, err := tools.LookupArtifact(tools.ToolFFprobe, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Skip(err)
+	}
+	mpegArt, _ := tools.LookupArtifact(tools.ToolFFmpeg, runtime.GOOS, runtime.GOARCH)
+	ffprobe := (&tools.Manager{Root: root, Artifact: probeArt}).BinaryPath()
+	ffmpeg := (&tools.Manager{Root: root, Artifact: mpegArt}).BinaryPath()
+	dir := t.TempDir()
+
+	t.Run("valid video with default frames", func(t *testing.T) {
+		in := copyVideo(t, dir, "sample.mp4", "clip.mp4")
+		before := sha(t, in)
+		r := runReal(t, cache, "preview", in)
+		if r.err != nil {
+			t.Fatalf("%v\nstderr:\n%s", r.err, r.stderr)
+		}
+		base := strings.TrimSuffix(in, ".mp4")
+		cover := probeFirstStream(t, ffprobe, base+"_cover.jpg")
+		video := probeFirstStream(t, ffprobe, base+"_preview.mp4")
+		mosaic := probeFirstStream(t, ffprobe, base+"_preview.jpg")
+		if cover.Width != 320 || cover.Height != 240 {
+			t.Errorf("cover = %dx%d, want 320x240", cover.Width, cover.Height)
+		}
+		if video.CodecName != "h264" || video.PixFmt != "yuv420p" || video.AvgFrameRate != "4/1" ||
+			video.NbFrames != "100" || video.Width != 320 || video.Height != 240 {
+			t.Errorf("preview video = %+v", video)
+		}
+		if w, h := media.MosaicSize(4.0 / 3); mosaic.Width != w || mosaic.Height != h { // sample.mp4 is 4:3
+			t.Errorf("mosaic = %dx%d, want %dx%d", mosaic.Width, mosaic.Height, w, h)
+		}
+		if sha(t, in) != before {
+			t.Error("the original changed")
+		}
+	})
+
+	t.Run("non-default frames and rotation", func(t *testing.T) {
+		in := copyVideo(t, dir, "rotated.mp4", "rotated.mp4")
+		r := runReal(t, cache, "preview", "--frames", "7", in)
+		if r.err != nil {
+			t.Fatalf("%v\nstderr:\n%s", r.err, r.stderr)
+		}
+		base := strings.TrimSuffix(in, ".mp4")
+		cover := probeFirstStream(t, ffprobe, base+"_cover.jpg")
+		video := probeFirstStream(t, ffprobe, base+"_preview.mp4")
+		mosaic := probeFirstStream(t, ffprobe, base+"_preview.jpg")
+		if cover.Width != 240 || cover.Height != 320 {
+			t.Errorf("cover = %dx%d, want 240x320", cover.Width, cover.Height)
+		}
+		if video.NbFrames != "7" || video.Width != 240 || video.Height != 320 {
+			t.Errorf("preview video = %+v", video)
+		}
+		if w, h := media.MosaicSize(3.0 / 4); mosaic.Width != w || mosaic.Height != h { // rotated.mp4 displays as 3:4
+			t.Errorf("mosaic = %dx%d, want %dx%d", mosaic.Width, mosaic.Height, w, h)
+		}
+	})
+
+	t.Run("4K portrait frames fit the mosaic", func(t *testing.T) {
+		in := filepath.Join(dir, "uhd.mp4")
+		gen := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+			"-f", "lavfi", "-i", "testsrc=size=2160x3840:rate=10:duration=1",
+			"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", in)
+		if out, err := gen.CombinedOutput(); err != nil {
+			t.Fatalf("generate 4K clip: %v\n%s", err, out)
+		}
+		r := runReal(t, cache, "preview", in)
+		if r.err != nil {
+			t.Fatalf("%v\nstderr:\n%s", r.err, r.stderr)
+		}
+		mosaic := probeFirstStream(t, ffprobe, strings.TrimSuffix(in, ".mp4")+"_preview.jpg")
+		if w, h := media.MosaicSize(9.0 / 16); mosaic.Width != w || mosaic.Height != h { // 2160x3840 is 9:16
+			t.Errorf("mosaic = %dx%d, want %dx%d", mosaic.Width, mosaic.Height, w, h)
+		}
+	})
+
+	t.Run("unfinished mp4 fails validation", func(t *testing.T) {
+		in := copyVideo(t, dir, "unfinished.mp4", "unfinished.mp4")
+		before := sha(t, in)
+		r := runReal(t, cache, "preview", in)
+		if r.err == nil || !strings.Contains(r.err.Error(), "inspect: ffprobe could not read the file") || !strings.Contains(r.err.Error(), in) {
+			t.Fatalf("err = %v", r.err)
+		}
+		if sha(t, in) != before {
+			t.Error("the original changed")
+		}
+		for _, s := range []string{"_cover.jpg", "_preview.mp4", "_preview.jpg"} {
+			if _, err := os.Stat(strings.TrimSuffix(in, ".mp4") + s); err == nil {
+				t.Errorf("output %s was created", s)
+			}
+		}
+	})
+
+	t.Run("inspection passes but extraction fails", func(t *testing.T) {
+		in := copyVideo(t, dir, "truncated_faststart.mp4", "truncated.mp4")
+		before := sha(t, in)
+		base := strings.TrimSuffix(in, ".mp4")
+		for _, s := range []string{"_cover.jpg", "_preview.mp4", "_preview.jpg"} {
+			if err := os.WriteFile(base+s, []byte("old"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		r := runReal(t, cache, "inspect", in)
+		if r.err != nil {
+			t.Fatalf("inspect should pass: %v", r.err)
+		}
+		r = runReal(t, cache, "preview", "--overwrite", "--faststart-in-place", in)
+		if r.err == nil || !strings.Contains(r.err.Error(), "extract frames") || !strings.Contains(r.err.Error(), "no frame decoded") {
+			t.Fatalf("err = %v", r.err)
+		}
+		if sha(t, in) != before {
+			t.Error("the original changed")
+		}
+		for _, s := range []string{"_cover.jpg", "_preview.mp4", "_preview.jpg"} {
+			if data, _ := os.ReadFile(base + s); string(data) != "old" {
+				t.Errorf("earlier output %s was not preserved", s)
+			}
+		}
+	})
+
+	t.Run("faststart in place keeps streams", func(t *testing.T) {
+		in := copyVideo(t, dir, "sample.mp4", "fs.mp4")
+		hashBefore := streamHash(t, ffmpeg, in)
+		r := runReal(t, cache, "preview", "--faststart-in-place", "--json", in)
+		if r.err != nil {
+			t.Fatalf("%v\nstderr:\n%s", r.err, r.stderr)
+		}
+		if !strings.Contains(r.stdout, `"faststart": "applied"`) {
+			t.Errorf("unexpected result: %s", r.stdout)
+		}
+		if ok, err := media.IsFastStart(in); err != nil || !ok {
+			t.Errorf("original is not faststart after the run: %v, %v", ok, err)
+		}
+		if got := streamHash(t, ffmpeg, in); got != hashBefore {
+			t.Errorf("streams changed:\nbefore %s\nafter  %s", hashBefore, got)
+		}
+		if fi, _ := os.Stat(in); fi.Mode().Perm() != 0o640 {
+			t.Errorf("mode = %v, want 0640", fi.Mode().Perm())
+		}
+	})
+}
+
+// meanLuma returns the average luma of a region of the first frame.
+func meanLuma(t *testing.T, ffmpeg, p string, x, y, w, h int) float64 {
+	t.Helper()
+	out, err := exec.Command(ffmpeg, "-hide_banner", "-i", p, "-frames:v", "1",
+		"-vf", fmt.Sprintf("crop=%d:%d:%d:%d,signalstats,metadata=print:key=lavfi.signalstats.YAVG", w, h, x, y),
+		"-f", "null", "-").CombinedOutput()
+	if err != nil {
+		t.Fatalf("measure %s: %v\n%s", p, err, out)
+	}
+	_, after, ok := strings.Cut(string(out), "lavfi.signalstats.YAVG=")
+	if !ok {
+		t.Fatalf("no luma for %s", p)
+	}
+	v, err := strconv.ParseFloat(strings.Fields(after)[0], 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+// whiteSide reports which edge of a region is white, using bands that
+// avoid the timestamp overlay in the top-left corner.
+func whiteSide(t *testing.T, ffmpeg, p string, x0, y0, w, h int) string {
+	t.Helper()
+	bw, bh := w/5, h/5
+	top := meanLuma(t, ffmpeg, p, x0+w-2*bw, y0, 2*bw, bh)
+	bottom := meanLuma(t, ffmpeg, p, x0+w-2*bw, y0+h-bh, 2*bw, bh)
+	left := meanLuma(t, ffmpeg, p, x0, y0+h-2*bh, bw, 2*bh)
+	right := meanLuma(t, ffmpeg, p, x0+w-bw, y0+h-2*bh, bw, 2*bh)
+	switch {
+	case top > 180 && bottom < 70:
+		return "top"
+	case bottom > 180 && top < 70:
+		return "bottom"
+	case left > 180 && right < 70:
+		return "left"
+	case right > 180 && left < 70:
+		return "right"
+	}
+	return fmt.Sprintf("unclear (top %.0f bottom %.0f left %.0f right %.0f)", top, bottom, left, right)
+}
+
+func TestIntegrationPreviewAspect(t *testing.T) {
+	cache := testCache(t)
+	root, _ := tools.DefaultCacheRoot(cache)
+	var paths [2]string
+	for i, tool := range []string{tools.ToolFFmpeg, tools.ToolFFprobe} {
+		a, err := tools.LookupArtifact(tool, runtime.GOOS, runtime.GOARCH)
+		if err != nil {
+			t.Skip(err)
+		}
+		p, err := (&tools.Manager{Root: root, Artifact: a}).Ensure(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		paths[i] = p
+	}
+	ffmpeg, ffprobe := paths[0], paths[1]
+
+	cases := []struct {
+		name string
+		w, h int
+		sar  string
+		// rotation is the -display_rotation value: counterclockwise degrees.
+		rotation     int
+		aspectW      int
+		aspectH      int
+		dispW, dispH int
+		side         string
+	}{
+		{"16x9", 1280, 720, "1/1", 0, 16, 9, 1280, 720, "top"},
+		{"9x16", 720, 1280, "1/1", 0, 9, 16, 720, 1280, "top"},
+		{"4x3", 960, 720, "1/1", 0, 4, 3, 960, 720, "top"},
+		{"3x4", 720, 960, "1/1", 0, 3, 4, 720, 960, "top"},
+		{"4x3_rotated_ccw90", 960, 720, "1/1", 90, 3, 4, 720, 960, "left"},
+		{"4x3_rotated_cw90", 960, 720, "1/1", -90, 3, 4, 720, 960, "right"},
+		{"16x9_rotated_cw90", 1280, 720, "1/1", -90, 9, 16, 720, 1280, "right"},
+		{"anamorphic_16x9", 704, 480, "40/33", 0, 16, 9, 853, 480, "top"},
+		{"1x1", 720, 720, "1/1", 0, 1, 1, 720, 720, "top"},
+		{"320x180_16x9", 320, 180, "1/1", 0, 16, 9, 320, 180, "top"},
+		{"4K_9x16_phone", 2160, 3840, "1/1", 0, 9, 16, 2160, 3840, "top"},
+	}
+	// darkArea holds, per case, the dark pixels of the timestamp box in the
+	// first mosaic cell; it must not depend on resolution or aspect ratio.
+	darkArea := map[string]int{}
+	dir := t.TempDir()
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			src := filepath.Join(dir, c.name+"_src.mp4")
+			in := filepath.Join(dir, c.name+".mp4")
+			gen := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+				"-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=%dx%d:r=10:d=1", c.w, c.h),
+				"-vf", "drawbox=x=0:y=0:w=iw:h=ih/2:color=white:t=fill,setsar="+c.sar,
+				"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", src)
+			if out, err := gen.CombinedOutput(); err != nil {
+				t.Fatalf("generate: %v\n%s", err, out)
+			}
+			rot := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+				"-display_rotation", strconv.Itoa(c.rotation), "-i", src, "-c", "copy", in)
+			if out, err := rot.CombinedOutput(); err != nil {
+				t.Fatalf("rotate: %v\n%s", err, out)
+			}
+
+			srcInfo, err := media.Inspect(t.Context(), ffprobe, in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (c.rotation != 0) != (srcInfo.Video.Rotation != 0) {
+				t.Fatalf("test input rotation is %d, want it set: %v", srcInfo.Video.Rotation, c.rotation != 0)
+			}
+
+			for _, mode := range []string{"auto", "cpu"} {
+				t.Run(mode, func(t *testing.T) {
+					data, err := os.ReadFile(in)
+					if err != nil {
+						t.Fatal(err)
+					}
+					in := strings.TrimSuffix(in, ".mp4") + "_" + mode + ".mp4"
+					if err := os.WriteFile(in, data, 0o644); err != nil {
+						t.Fatal(err)
+					}
+					r := runReal(t, cache, "preview", "--frames", "10", "--json", "--accel", mode, in)
+					if r.err != nil {
+						t.Fatalf("%v\nstderr:\n%s", r.err, r.stderr)
+					}
+					var res struct {
+						FrameDecoder   string `json:"frame_decoder"`
+						PreviewEncoder string `json:"preview_encoder"`
+					}
+					if err := json.Unmarshal([]byte(r.stdout), &res); err != nil {
+						t.Fatalf("result: %v\n%s", err, r.stdout)
+					}
+					// On macOS, auto mode must really decode with VideoToolbox for
+					// these H.264 inputs; the stderr log says why otherwise.
+					wantDecoder := "cpu"
+					if mode == "auto" && runtime.GOOS == "darwin" {
+						wantDecoder = "videotoolbox"
+					}
+					if res.FrameDecoder != wantDecoder {
+						t.Errorf("frame decoder %q, want %q\nstderr:\n%s", res.FrameDecoder, wantDecoder, r.stderr)
+					}
+					// The JSON must name the encoder that actually wrote the preview,
+					// as the log reports it. Auto mode on macOS tries
+					// h264_videotoolbox; a test encode failure falls back to libx264
+					// with the reason in the log.
+					encoderName := map[string]string{"cpu": "libx264", "videotoolbox": "h264_videotoolbox"}[res.PreviewEncoder]
+					if encoderName == "" || !strings.Contains(r.stderr, "encoded preview video with "+encoderName+" in ") {
+						t.Errorf("preview encoder %q does not match the log:\n%s", res.PreviewEncoder, r.stderr)
+					}
+					if mode == "cpu" && res.PreviewEncoder != "cpu" {
+						t.Errorf("preview encoder %q with --accel cpu", res.PreviewEncoder)
+					}
+					if mode == "auto" && runtime.GOOS == "darwin" && res.PreviewEncoder != "videotoolbox" {
+						t.Logf("auto mode encoded with libx264:\n%s", r.stderr)
+					}
+					aspect := float64(c.aspectW) / float64(c.aspectH)
+					base := strings.TrimSuffix(in, ".mp4")
+					cover := probeFirstStream(t, ffprobe, base+"_cover.jpg")
+					video := probeFirstStream(t, ffprobe, base+"_preview.mp4")
+					mosaic := probeFirstStream(t, ffprobe, base+"_preview.jpg")
+
+					if cover.Width != c.dispW || cover.Height != c.dispH {
+						t.Errorf("cover %dx%d, want %dx%d", cover.Width, cover.Height, c.dispW, c.dispH)
+					}
+					// Rounding each dimension to an even value moves it by less than
+					// 2 pixels, so the aspect ratio may differ by up to 2/w + 2/h.
+					tolerance := 2/float64(video.Width) + 2/float64(video.Height)
+					dar, ok := parseRatio(video.DAR)
+					if video.CodecName != "h264" {
+						t.Errorf("preview codec %q, want h264", video.CodecName)
+					}
+					if video.SAR != "1:1" || !ok || math.Abs(dar/aspect-1) > tolerance ||
+						math.Abs(float64(video.Width)/float64(video.Height)/aspect-1) > tolerance {
+						t.Errorf("preview %dx%d SAR %s DAR %s, want aspect %d:%d within %.4f",
+							video.Width, video.Height, video.SAR, video.DAR, c.aspectW, c.aspectH, tolerance)
+					}
+					// The pixels are already rotated, so no rotation metadata may remain
+					// for a player to apply again.
+					outInfo, err := media.Inspect(t.Context(), ffprobe, base+"_preview.mp4")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if outInfo.Video.Rotation != 0 {
+						t.Errorf("preview keeps a rotation of %d degrees; source had %d", outInfo.Video.Rotation, srcInfo.Video.Rotation)
+					}
+					wantW, wantH := media.MosaicSize(aspect)
+					gridAspect := float64(mosaic.Width) / float64(mosaic.Height-40)
+					if mosaic.Width != wantW || mosaic.Height != wantH || math.Abs(gridAspect/aspect-1) > 0.01 {
+						t.Errorf("mosaic %dx%d (grid aspect %.4f), want %dx%d (aspect %.4f)", mosaic.Width, mosaic.Height, gridAspect, wantW, wantH, aspect)
+					}
+
+					cw, ch := media.MosaicCell(aspect)
+					sides := map[string]string{
+						"cover":       whiteSide(t, ffmpeg, base+"_cover.jpg", 0, 0, cover.Width, cover.Height),
+						"preview":     whiteSide(t, ffmpeg, base+"_preview.mp4", 0, 0, video.Width, video.Height),
+						"mosaic cell": whiteSide(t, ffmpeg, base+"_preview.jpg", 0, 40, cw, ch),
+					}
+					for what, side := range sides {
+						if side != c.side {
+							t.Errorf("%s: white side is %s, want %s", what, side, c.side)
+						}
+					}
+					// The measured region is all white only when the white half is on top.
+					if c.side == "top" {
+						darkArea[c.name+"/"+mode] = overlayDarkArea(t, ffmpeg, base+"_preview.jpg", 0, 40)
+					}
+					t.Logf("%s, decoder %s, encoder %s: source %dx%d SAR %s rotation %d (clockwise %d) -> display %dx%d (%d:%d); cover %dx%d; preview %dx%d SAR %s DAR %s (%.4f, want %.4f) rotation %d; mosaic %dx%d, grid %dx%d; white side %s",
+						mode, res.FrameDecoder, res.PreviewEncoder, c.w, c.h, strings.Replace(c.sar, "/", ":", 1), c.rotation, srcInfo.Video.Rotation, c.dispW, c.dispH, c.aspectW, c.aspectH,
+						cover.Width, cover.Height, video.Width, video.Height, video.SAR, video.DAR, dar, aspect, outInfo.Video.Rotation,
+						mosaic.Width, mosaic.Height, mosaic.Width, mosaic.Height-40, sides["cover"])
+				})
+			}
+		})
+	}
+	ref, ok := darkArea["16x9/cpu"]
+	if !ok || ref == 0 {
+		t.Fatalf("no reference overlay measurement: %v", darkArea)
+	}
+	for name, area := range darkArea {
+		t.Logf("overlay dark area in the first mosaic cell: %s %d px (16x9/cpu: %d px)", name, area, ref)
+		if math.Abs(float64(area)/float64(ref)-1) > 0.2 {
+			t.Errorf("%s: overlay dark area %d px differs from 16x9/cpu (%d px) by more than 20%%", name, area, ref)
+		}
+	}
+}
+
+// parseRatio reads an FFprobe ratio such as "16:9".
+func parseRatio(s string) (float64, bool) {
+	a, b, ok := strings.Cut(s, ":")
+	if !ok {
+		return 0, false
+	}
+	num, err1 := strconv.ParseFloat(a, 64)
+	den, err2 := strconv.ParseFloat(b, 64)
+	if err1 != nil || err2 != nil || num <= 0 || den <= 0 {
+		return 0, false
+	}
+	return num / den, true
+}
+
+// overlayDarkArea counts dark pixels in the 120x30 region at the top-left of
+// a mosaic cell. On a white source that region holds the timestamp box, so
+// the count follows the overlay size in the mosaic.
+func overlayDarkArea(t *testing.T, ffmpeg, p string, x, y int) int {
+	t.Helper()
+	out, err := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-i", p,
+		"-vf", fmt.Sprintf("crop=120:30:%d:%d,format=gray", x, y),
+		"-frames:v", "1", "-f", "rawvideo", "-").Output()
+	if err != nil {
+		t.Fatalf("read overlay region of %s: %v", p, err)
+	}
+	dark := 0
+	for _, v := range out {
+		if v < 128 {
+			dark++
+		}
+	}
+	return dark
+}
