@@ -1,8 +1,14 @@
 # Platform validation
 
-These checks confirm that musafoz works on a machine without FFmpeg or
-FFprobe. Use a sample video of your own; the commands below call it
-clip.mp4. Record the results in docs/decisions/0005-linux-and-windows-tools.md.
+These checks confirm that musafoz works without a compatible local FFmpeg
+and FFprobe. Use a sample video of your own. The examples call it clip.mp4.
+
+Record the platform, release tag or source commit, and test results.
+Use the ZIP's release tag to identify the v0.1.0-alpha.2 build.
+A future `musafoz --version` flag should report the MusaFoz build version
+without resolving or downloading media tools. See
+[the platform decision record](decisions/0005-linux-and-windows-tools.md)
+for validation results, including the native Linux run.
 
 ## Linux x86-64
 

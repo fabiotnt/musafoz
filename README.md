@@ -1,9 +1,9 @@
 # MusaFoz
 
-MusaFoz is a command-line toolkit for video previews, still images, and
-media inspection. Generate a cover, an MP4 preview, and a timestamped
-mosaic from one video. Extract individual frames, resize photos from
-files or URLs, and inspect image metadata including EXIF.
+MusaFoz is a command-line toolkit for inspecting media, generating video
+previews, and preparing photos and videos for the web. Extract covers and
+individual frames, resize photos including HEIC, or process a list of
+files and URLs with a report for each item.
 
 ## Install
 
@@ -27,7 +27,8 @@ go build -o musafoz ./cmd/musafoz
 | Generate only a cover | `musafoz cover clip.mp4 00:03:55` |
 | Extract a clean video frame | `musafoz image clip.mp4 00:01:00 --output ./frames` |
 | Resize a photo | `musafoz thumb photo.png --size 320x240` |
-| Make web copies of a library | `musafoz web batch sources.txt --output ./web --metadata ./meta --jsonl` |
+| Make square thumbnails with a report | `musafoz thumb batch sources.txt --size 480x480 --mode fill --quality 80 --output ./thumbs --jsonl > thumbs.jsonl` |
+| Make web copies of a library | `musafoz web batch sources.txt --output ./web --metadata ./private --skip-existing --jsonl` |
 
 Use `musafoz <command> --help` to see the available flags. This README
 describes the current source tree. Check the release notes for the
@@ -208,36 +209,42 @@ minutes. Video downloads are limited to 8 GiB and 60 minutes.
 ## Make web copies
 
 ```sh
-musafoz web IMG_0001.HEIC --output ./web --metadata ./web
-musafoz web batch sources.txt --output ./web --metadata ./web --jsonl > report.jsonl
-musafoz web batch sources.txt --output ./web --metadata ./web --skip-existing --jsonl >> report.jsonl
+musafoz web IMG_0001.HEIC --output ./single --metadata ./single
+musafoz web batch sources.txt --output ./web --metadata ./private \
+  --skip-existing --jsonl > web-report.jsonl
 ```
 
-`web` is the import flow of a library: it turns photos and videos into
-files every browser shows, with their own size contract, and records what
-it read from each source. The files are named by a UUID derived from the
-SHA-256 of the original, so the same content always gets the same name and
-a list converts it once.
+`web` creates browser-ready copies of photos and videos, with optional
+metadata records for import. Set `--output` to the destination directory.
+For a batch, put one local path or direct HTTP(S) URL per line. Relative
+paths are resolved from the list directory. A UUID derived from the
+SHA-256 of the original names each set of outputs. If the same content
+appears again in the batch, it is reported as `duplicate` with the same
+UUID.
 
 | Source | Outputs |
 | --- | --- |
 | JPEG, PNG, GIF, WebP, BMP, TIFF, HEIC | `<uuid>.jpg` at most 2560 pixels on the long side, and `<uuid>_thumb.jpg` 480 pixels on the short side |
 | Video | `<uuid>.mp4`, plus `<uuid>_cover.jpg`, `<uuid>_preview.mp4`, and `<uuid>_preview.jpg` as made by `preview` |
 
-- Images are never enlarged. The orientation is applied, colors are
-  converted to sRGB, and the JPEGs carry no metadata. Quality is 85 for
-  images and 80 for thumbnails (`--quality`, `--thumb-quality`).
-- Videos become H.264 High and stereo AAC in MP4, at most 1080p in their
-  own orientation and 5 Mbps (`--video-size`, `--video-bitrate`), with
-  the index at the start of the file. HDR video (HLG or PQ) is tone mapped
-  to SDR. Container tags, including the recording place, are removed.
-  `--no-preview` skips the cover, preview video, and mosaic.
-- `--metadata DIR` writes the record `<uuid>.json`: every field read from
-  the source (the full EXIF, XMP, color profile, and sizes of an image, or
-  the FFprobe output of a video with its container tags), the settings
-  that made the outputs, and the name and SHA-256 of each output. It may
-  be the `--output` directory. Records hold GPS positions: keep them
-  private.
+- Images keep their proportions without being enlarged. MusaFoz applies
+  orientation and converts supported color profiles to sRGB before writing
+  JPEGs without source metadata. Use `--image-size` and `--thumb-size`
+  to set dimensions, and `--quality` and `--thumb-quality` to set JPEG
+  quality. The default quality is 85 for images and 80 for thumbnails.
+- Videos use H.264 High in MP4 with faststart and stereo AAC when audio is
+  present. The defaults are up to 1080p in either orientation and a 5 Mbps
+  video bitrate cap (`--video-size` and `--video-bitrate`). HDR video
+  (HLG or PQ) is tone mapped to SDR using the FFmpeg `zscale` and
+  `tonemap` filters. Source container tags are removed. Use `--frames`
+  to set the preview frame count or `--no-preview` to skip all three
+  preview outputs.
+- `--metadata DIR` writes a private `<uuid>.json` record with source
+  metadata, generation settings, and the name and SHA-256 of each output.
+  It can contain EXIF with GPS, XMP, color information, or raw FFprobe
+  metadata. The directory can be the same as `--output`. If you upload
+  both to one location, keep objects private by default and grant public
+  read access only to an explicit list of media objects.
 
 For square 480x480 thumbnails with a report, without the import outputs,
 use `musafoz thumb batch sources.txt --size 480x480 --mode fill --quality
@@ -245,35 +252,40 @@ use `musafoz thumb batch sources.txt --size 480x480 --mode fill --quality
 
 ### Interrupted runs
 
-Each content is made in `.musafoz-staging/` inside the output directory.
-Then a pending file, `.<uuid>.musafoz-pending.json`, records the name and
-SHA-256 of every output. The outputs are placed, and the record is written
-last. A record therefore means a finished content.
+MusaFoz generates each item's files in `.musafoz-staging/` inside the
+output directory. A pending file, `.<uuid>.musafoz-pending.json`, records
+the name and SHA-256 of every output before they are placed. When
+`--metadata` is set, MusaFoz writes the metadata record last to mark
+completion.
 
-`--skip-existing` makes a run safe to repeat after an interruption:
+Use `--skip-existing` from the first run to reuse completed work and
+recover from interruptions. It requires `--metadata`. Repeat the
+command with the same output and metadata directories and settings.
+Write each attempt's JSONL to its own file if you need to keep the
+history.
+
+The result depends on what is already on disk:
 
 | State found | Result |
 | --- | --- |
-| Record with the same settings, every output in `--output` with its recorded SHA-256 | Reused, status `exists`, nothing written |
-| Record, but an output missing or changed, or another `--output` directory | Made again, status `resumed` |
+| Record with the same settings, every output in `--output` with its recorded SHA-256 | Reused, status `exists`, media unchanged |
+| Record with the same settings, but an expected output is missing in `--output` | Made again, status `resumed` |
 | Pending file, no record (stopped while placing outputs) | Made again, status `resumed` |
 | Record made with other settings | Error naming the settings, such as `image_quality 85 -> 70`; `--overwrite` makes it again |
-| A file at an output name that no record or pending file vouches for | Conflict; the file is kept |
+| An existing output with an unrecognized SHA-256 | Conflict; the file is kept |
 
-When a content is finished, musafoz replaces only files whose SHA-256 is
-in the record or the pending file, or that already have the new content.
-Settings are compared per kind: a change of image size does not concern
-videos. The SHA-256 of the original is computed before anything else,
-because the UUID depends on it, so a reused content still costs one full
-read of its original. The `timings` of each result separate that read from
-the conversion and from the check of existing outputs.
+During recovery, MusaFoz only replaces files verified against a recorded
+checksum or the newly generated output. MusaFoz compares settings by
+media type. Reusing an item still requires reading the entire original
+to compute its SHA-256 and UUID. The `timings` field reports hashing,
+conversion, and output verification separately.
 
 Without `--skip-existing` or `--overwrite`, an existing record, an
 unfinished content, or an existing output is an error, and nothing is
 replaced. Processes that share an output directory never work on the same
-UUID at once. Tasks on different machines need their own output
-directories and a claim per UUID at upload time; see
-[the pilot guide](docs/web-pilot.md).
+UUID at once. This coordination applies to local runs that share an
+output directory. See [the pilot guide](docs/web-pilot.md) for the Linux
+container results and the pending Cloud Run upload and access checks.
 
 ### Report
 
@@ -287,10 +299,10 @@ the XMP marks a screenshot, `metadata`, and `timings`. Video dates come
 from the QuickTime creation date that phones write, with its UTC offset,
 or else from `creation_time` in UTC.
 
-The report has no GPS or camera data, but it maps every original path to
-its UUID. Treat it as internal, like the records. Upload only the media
-files the site serves as public objects; see
-[the pilot guide](docs/web-pilot.md).
+The report omits GPS and camera fields and strips credentials, query
+parameters, and fragments from source URLs. Keep it private because it
+identifies the sources. The batch continues after a failed item and exits
+with a nonzero status if any item failed.
 
 ## Generate a video preview
 

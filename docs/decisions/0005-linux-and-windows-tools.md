@@ -190,8 +190,17 @@ machine.
   cell and keeps 20 percent for the others, which measured within 4
   percent.
 
-Pending: a run on a physical or virtual Linux machine outside Docker,
-following docs/validation.md.
+Native Linux x86-64, 2026-11-23, using the published v0.1.0-alpha.2 ZIP:
+
+- FFmpeg and FFprobe 5.1 on the PATH were rejected because the minimum
+  supported version is 6. An earlier run downloaded the managed
+  n9.0.2-39-g7adfbe40dc builds. The logged run reused them.
+- On a 192-second clip, `preview --frames 25 --cover-at 00:00:01.250 --json`
+  produced the three outputs. The JSON reported 25 frames, a cover at
+  1.25 seconds, and CPU decoding and encoding. The log confirmed embedded
+  DejaVu Sans Mono 2.37 and a 5x5 grid with 768x432 cells.
+- This run completed in 6.6 seconds. Offline reuse was validated in Docker
+  as described above. The native cache reuse run did not test offline mode.
 
 ### Windows x86-64
 
