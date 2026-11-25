@@ -61,6 +61,9 @@ func NewRootCommand(env Env) *cobra.Command {
 
 	root.AddCommand(newInspectCommand(env, opts))
 	root.AddCommand(newPreviewCommand(env, opts))
+	root.AddCommand(newCoverCommand(env, opts))
+	root.AddCommand(newImageCommand(env, opts))
+	root.AddCommand(newThumbCommand(env, opts))
 	root.AddCommand(newLicensesCommand(env))
 	return root
 }

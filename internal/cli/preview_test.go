@@ -2,6 +2,9 @@ package cli
 
 import (
 	"encoding/json"
+	"fmt"
+	"image"
+	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +22,7 @@ for a in "$@"; do
   out="$a"
 done
 case "$out" in -*) exit 0;; esac
+case "$*" in *"-c:v png"*) cp "$FAKE_PNG" "$out"; exit 0;; esac
 echo data > "${out#file:}"
 `
 
@@ -48,6 +52,7 @@ func newPreviewFixture(t *testing.T) previewFixture {
 	if err := os.WriteFile(font, []byte("\x00\x01\x00\x00fake TrueType"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("FAKE_PNG", writePNG(t, tools, 8, 6))
 	return previewFixture{
 		input: input,
 		args:  []string{"--ffprobe", fakeFFprobe(t, "sample.json"), "--ffmpeg", ffmpeg, "preview", "--font", font, "--frames", "3"},
@@ -162,4 +167,25 @@ func TestPreviewRejectsCoverAt(t *testing.T) {
 			}
 		}
 	}
+}
+
+// writePNG writes an opaque gray PNG of the given size.
+func writePNG(t *testing.T, dir string, w, h int) string {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for i := range img.Pix {
+		img.Pix[i] = 200
+	}
+	p := filepath.Join(dir, fmt.Sprintf("frame-%dx%d.png", w, h))
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(f, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return p
 }

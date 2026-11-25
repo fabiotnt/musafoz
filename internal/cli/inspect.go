@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,25 +9,43 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/fabiotnt/musafoz/internal/fetch"
+	"github.com/fabiotnt/musafoz/internal/imaging"
 	"github.com/fabiotnt/musafoz/internal/media"
 )
 
 func newInspectCommand(env Env, root *rootOptions) *cobra.Command {
 	var asJSON bool
 	cmd := &cobra.Command{
-		Use:   "inspect <file>",
-		Short: "Show duration, dimensions, codecs, and stream details of a video",
-		Long: "Inspect a local video with FFprobe.\n\n" +
-			"FFprobe is resolved from --ffprobe, then MUSAFOZ_FFPROBE, then the managed\n" +
-			"cache. The managed build is downloaded and verified on first use. The PATH\n" +
-			"is not searched.",
-		Example: "  musafoz inspect clip.mp4\n  musafoz inspect clip.mp4 --json",
-		Args:    cobra.ExactArgs(1),
+		Use:   "inspect <file or image URL>",
+		Short: "Show the details of a video or an image",
+		Long: "Inspect a local video with FFprobe, or a local image or direct HTTP or HTTPS\n" +
+			"image URL without FFprobe.\n\n" +
+			"For videos, FFprobe is resolved from --ffprobe, then MUSAFOZ_FFPROBE, then a\n" +
+			"compatible ffprobe on the PATH on Linux and Windows, then the managed build,\n" +
+			"which is downloaded and verified on first use.\n\n" +
+			"For images (JPEG, PNG, GIF, WebP, BMP, TIFF, and HEIC), the result gives the\n" +
+			"format, the stored and displayed size, the EXIF orientation, and transparency.\n" +
+			"With --json it also lists every readable EXIF tag, including GPS, camera,\n" +
+			"lens, and exposure tags, under exif, with the numeric tag ids. Maker notes are\n" +
+			"shown as raw bytes and not decoded. HEIC files are read from their container\n" +
+			"without FFmpeg; their HEIF rotation and mirroring, not the EXIF orientation,\n" +
+			"give the displayed orientation.",
+		Example: "  musafoz inspect clip.mp4\n  musafoz inspect clip.mp4 --json\n" +
+			"  musafoz inspect photo.jpg --json\n  musafoz inspect https://example.com/photo.jpg",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := args[0]
-			// Fail fast on bad input before any download.
+			if fetch.IsURL(path) {
+				return inspectImageURL(cmd.Context(), env, path, asJSON)
+			}
 			if err := media.ValidateInput(path); err != nil {
 				return err
+			}
+			if format, err := imaging.SniffFile(path); err != nil {
+				return err
+			} else if format != "" {
+				return inspectImage(env, path, path, asJSON)
 			}
 			ffprobe, err := resolveFFprobe(cmd.Context(), env, root)
 			if err != nil {
@@ -155,4 +174,89 @@ func humanBytes(n int64) string {
 		return fmt.Sprintf("%.2f KiB", float64(n)/(1<<10))
 	}
 	return fmt.Sprintf("%d B", n)
+}
+
+// inspectImageURL downloads an image URL and inspects it. Videos are
+// inspected from local files only.
+func inspectImageURL(ctx context.Context, env Env, raw string, asJSON bool) error {
+	label := fetch.Redact(raw)
+	f, err := fetch.New(fetch.MaxImageBytes, fetch.ImageTimeout, func(format string, a ...any) {
+		fmt.Fprintf(env.Stderr, format+"\n", a...)
+	})
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	local, err := f.Fetch(ctx, raw)
+	if err != nil {
+		return err
+	}
+	format, err := imaging.SniffFile(local)
+	if err != nil {
+		return err
+	}
+	if format == "" {
+		return fmt.Errorf("inspect %s: not a supported image; videos are inspected from local files only", label)
+	}
+	return inspectImage(env, local, label, asJSON)
+}
+
+func inspectImage(env Env, path, name string, asJSON bool) error {
+	info, err := imaging.Inspect(path, name)
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", name, err)
+	}
+	for _, w := range info.Warnings {
+		fmt.Fprintf(env.Stderr, "warning: %s: %s\n", name, w)
+	}
+	if asJSON {
+		enc := json.NewEncoder(env.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(info)
+	}
+	writeImageText(env.Stdout, info)
+	return nil
+}
+
+func writeImageText(w io.Writer, info *imaging.Info) {
+	row := func(label, value string) {
+		fmt.Fprintf(w, "%-12s %s\n", label+":", value)
+	}
+	row("File", info.Path)
+	row("Size", fmt.Sprintf("%s (%d bytes)", humanBytes(info.SizeBytes), info.SizeBytes))
+	row("Format", imaging.FormatLabel(info.Format)+" image")
+	row("Dimensions", fmt.Sprintf("%dx%d", info.Width, info.Height))
+	if info.Format == imaging.FormatHEIF {
+		row("Transforms", imaging.HEIFLabel(info.HEIFTransforms)+" (HEIF irot and imir, applied)")
+		if info.Orientation != nil {
+			row("Orientation", fmt.Sprintf("%d (%s) in EXIF, not applied to HEIF", *info.Orientation, info.OrientationLabel))
+		}
+	} else if info.Orientation != nil {
+		row("Orientation", fmt.Sprintf("%d (%s)", *info.Orientation, info.OrientationLabel))
+	} else {
+		row("Orientation", "not set")
+	}
+	if info.DisplayWidth != info.Width || info.DisplayHeight != info.Height {
+		row("Display", fmt.Sprintf("%dx%d", info.DisplayWidth, info.DisplayHeight))
+	}
+	switch {
+	case info.TransparentPixels == nil && info.AlphaChannel:
+		row("Alpha", "alpha plane")
+	case info.TransparentPixels != nil && *info.TransparentPixels:
+		row("Alpha", "transparent pixels")
+	case info.AlphaChannel:
+		row("Alpha", "alpha channel, every pixel opaque")
+	default:
+		row("Alpha", "none")
+	}
+	for _, r := range info.EXIF.Summary() {
+		row(r[0], r[1])
+	}
+	if n := info.EXIF.Count(); n == 1 {
+		row("EXIF", "1 tag (use --json to list it)")
+	} else if n > 1 {
+		row("EXIF", fmt.Sprintf("%d tags (use --json to list them all)", n))
+	} else {
+		row("EXIF", "none")
+	}
 }

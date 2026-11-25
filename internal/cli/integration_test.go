@@ -15,14 +15,17 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,7 +34,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/fabiotnt/musafoz/internal/imaging"
 	"github.com/fabiotnt/musafoz/internal/media"
+	"github.com/fabiotnt/musafoz/internal/testimages"
 	"github.com/fabiotnt/musafoz/internal/tools"
 )
 
@@ -133,7 +138,6 @@ func TestIntegrationManagedFFprobe(t *testing.T) {
 			"corrupt.mp4":    "ffprobe could not read the file",
 			"audio_only.m4a": "no video stream found",
 			"cover_art.mp3":  "no video stream found",
-			"still.png":      "no video stream found",
 		}
 		for name, want := range fails {
 			r := runReal(t, cache, "inspect", testdata("video", name))
@@ -141,7 +145,21 @@ func TestIntegrationManagedFFprobe(t *testing.T) {
 				t.Errorf("%s: err = %v, want %q", name, r.err, want)
 			}
 		}
-		r := runReal(t, cache, "inspect", testdata("video", "raw.h264"))
+		// A PNG is inspected as an image now, and preview still rejects it.
+		r := runReal(t, cache, "inspect", testdata("video", "still.png"))
+		if r.err != nil || !strings.Contains(r.stdout, "Format:      PNG image") {
+			t.Errorf("still.png: err = %v\nstdout:\n%s", r.err, r.stdout)
+		}
+		r = runReal(t, cache, "preview", "--frames", "1", filepath.Join(t.TempDir(), "x.png"))
+		if r.err == nil {
+			t.Error("preview of a missing file succeeded")
+		}
+		png := copyVideo(t, t.TempDir(), "still.png", "still.png")
+		r = runReal(t, cache, "preview", png)
+		if r.err == nil || !strings.Contains(r.err.Error(), "no video stream found") {
+			t.Errorf("preview still.png: err = %v", r.err)
+		}
+		r = runReal(t, cache, "inspect", testdata("video", "raw.h264"))
 		if r.err != nil || !strings.Contains(r.stdout, "Duration:   unknown") || !strings.Contains(r.stderr, "warning:") {
 			t.Errorf("raw.h264: err = %v\nstdout:\n%s\nstderr:\n%s", r.err, r.stdout, r.stderr)
 		}
@@ -755,6 +773,295 @@ func TestIntegrationCoverAt(t *testing.T) {
 			t.Errorf("--cover-at %s: a cover was written", arg)
 		}
 	}
+}
+
+// TestIntegrationStills runs image, image batch, and cover with the real
+// tools on a video whose brightness rises with time, so each image shows
+// which frame was taken.
+func TestIntegrationStills(t *testing.T) {
+	ffmpeg, ffprobe := managedTools(t)
+	cache := testCache(t)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "ramp clip.mp4")
+	gen := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "nullsrc=size=320x180:rate=10:duration=4,geq=lum='min(235,16+T*50)':cb=128:cr=128",
+		"-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-pix_fmt", "yuv420p", src)
+	if out, err := gen.CombinedOutput(); err != nil {
+		t.Fatalf("generate: %v\n%s", err, out)
+	}
+	before := sha(t, src)
+	lumaAt := func(at float64) float64 { return 50 * at * 255 / 219 }
+	check := func(p string, w, h int, at float64) {
+		t.Helper()
+		s := probeFirstStream(t, ffprobe, p)
+		if s.Width != w || s.Height != h || s.CodecName != map[bool]string{true: "png", false: "mjpeg"}[strings.HasSuffix(p, ".png")] {
+			t.Errorf("%s: %s %dx%d, want %dx%d", filepath.Base(p), s.CodecName, s.Width, s.Height, w, h)
+		}
+		if at >= 0 {
+			if got := meanLuma(t, ffmpeg, p, 0, 0, w, h); math.Abs(got-lumaAt(at)) > 8 {
+				t.Errorf("%s: luma %.1f, want about %.1f", filepath.Base(p), got, lumaAt(at))
+			}
+		}
+	}
+
+	out := filepath.Join(dir, "frames")
+	r := runReal(t, cache, "image", src, "00:00:00", "00:00:01.250", "--output", out)
+	if r.err != nil {
+		t.Fatalf("%v\n%s", r.err, r.stderr)
+	}
+	check(filepath.Join(out, "ramp clip_00-00-00.jpg"), 320, 180, 0)
+	check(filepath.Join(out, "ramp clip_00-00-01-250.jpg"), 320, 180, 1.3)
+
+	r = runReal(t, cache, "image", src, "00:00:02", "--output", out, "--size", "100x100", "--mode", "fill", "--format", "png", "--suffix", "_sq")
+	if r.err != nil {
+		t.Fatalf("%v\n%s", r.err, r.stderr)
+	}
+	check(filepath.Join(out, "ramp clip_00-00-02_sq.png"), 100, 100, 2)
+	r = runReal(t, cache, "image", src, "00:00:02", "--output", out, "--size", "100x100", "--prefix", "fit-")
+	if r.err != nil {
+		t.Fatalf("%v\n%s", r.err, r.stderr)
+	}
+	check(filepath.Join(out, "fit-ramp clip_00-00-02.jpg"), 100, 56, 2)
+
+	r = runReal(t, cache, "image", src, "--random", "5", "--output", filepath.Join(dir, "random"))
+	if r.err != nil || len(strings.Fields(strings.ReplaceAll(r.stdout, " ", "_"))) != 5 {
+		t.Fatalf("random: %v\n%s\n%s", r.err, r.stdout, r.stderr)
+	}
+
+	// The rotated fixture is stored 320x240 and displayed 240x320.
+	rot := copyVideo(t, dir, "rotated.mp4", "rotated.mp4")
+	r = runReal(t, cache, "image", rot, "00:00:00", "--alongside")
+	if r.err != nil {
+		t.Fatalf("%v\n%s", r.err, r.stderr)
+	}
+	check(filepath.Join(dir, "rotated_00-00-00.jpg"), 240, 320, -1)
+
+	// A list mixing the local file and the same video by URL.
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Write(data)
+	}))
+	defer srv.Close()
+	list := filepath.Join(dir, "frames.tsv")
+	if err := os.WriteFile(list, []byte("ramp clip.mp4\t00:00:03\n"+
+		srv.URL+"/v/remote.mp4?k=SECRET\t00:00:01\n"+
+		srv.URL+"/v/remote.mp4?k=SECRET\t\n"+
+		"ramp clip.mp4\t00:00:09\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bout := filepath.Join(dir, "batch")
+	r = runReal(t, cache, "image", "batch", list, "--output", bout)
+	if r.err == nil || r.err.Error() != "1 of 4 list lines failed" || !strings.Contains(r.stderr, "line 4: ramp clip.mp4: time 00:00:09 is outside the video") {
+		t.Errorf("batch: %v\n%s", r.err, r.stderr)
+	}
+	if strings.Contains(r.stdout+r.stderr, "SECRET") || hits != 1 {
+		t.Errorf("batch: query shown or %d downloads\n%s", hits, r.stderr)
+	}
+	check(filepath.Join(bout, "ramp clip_00-00-03.jpg"), 320, 180, 3)
+	check(filepath.Join(bout, "remote_00-00-01.jpg"), 320, 180, 1)
+
+	// cover writes only the cover, with the shared extraction.
+	r = runReal(t, cache, "cover", src, "00:00:01.500")
+	if r.err != nil {
+		t.Fatalf("%v\n%s", r.err, r.stderr)
+	}
+	check(filepath.Join(dir, "ramp clip_cover.jpg"), 320, 180, 1.5)
+	if _, err := os.Stat(filepath.Join(dir, "ramp clip_preview.mp4")); err == nil {
+		t.Error("cover wrote a preview")
+	}
+	// The cover is FFmpeg's own JPEG at -q:v 2, byte for byte, as is the
+	// preview cover at the same time.
+	direct := filepath.Join(t.TempDir(), "direct.jpg")
+	ref := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-ss", "1.500", "-i", "file:"+src,
+		"-vf", "scale=w=round(iw*sar):h=ih,setsar=1", "-frames:v", "1", "-update", "1", "-q:v", "2", direct)
+	if out, err := ref.CombinedOutput(); err != nil {
+		t.Fatalf("direct cover: %v\n%s", err, out)
+	}
+	if sha(t, filepath.Join(dir, "ramp clip_cover.jpg")) != sha(t, direct) {
+		t.Error("cover differs from the direct FFmpeg JPEG")
+	}
+	pdir := t.TempDir()
+	pin := filepath.Join(pdir, "ramp.mp4")
+	if err := os.WriteFile(pin, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r = runReal(t, cache, "preview", "--frames", "4", "--cover-at", "00:00:01.500", pin)
+	if r.err != nil {
+		t.Fatalf("%v\n%s", r.err, r.stderr)
+	}
+	if sha(t, filepath.Join(pdir, "ramp_cover.jpg")) != sha(t, direct) {
+		t.Error("preview cover differs from the direct FFmpeg JPEG")
+	}
+	// A random cover follows the preview rule: anywhere up to the last
+	// frame for this 4-second clip.
+	r = runReal(t, cache, "cover", "--json", "--overwrite", src)
+	var cres struct {
+		At float64 `json:"cover_at_seconds"`
+	}
+	if r.err != nil || json.Unmarshal([]byte(r.stdout), &cres) != nil || cres.At < 0 || cres.At > 3.9 {
+		t.Errorf("random cover: %v %s", r.err, r.stdout)
+	}
+	if sha(t, src) != before {
+		t.Error("the source video changed")
+	}
+}
+
+// quadrants names the colors at the centers of a cols x rows grid of an
+// image file: R, G, B, W, or ? for other colors.
+func quadrants(t *testing.T, p string, cols, rows int) string {
+	t.Helper()
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := imaging.Decode(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := img.Pixels.Bounds()
+	out := ""
+	for r := range rows {
+		for c := range cols {
+			R, G, B, _ := img.Pixels.At(b.Min.X+(2*c+1)*b.Dx()/(2*cols), b.Min.Y+(2*r+1)*b.Dy()/(2*rows)).RGBA()
+			switch {
+			case R > 0xC000 && G > 0xC000 && B > 0xC000:
+				out += "W"
+			case R > 0xC000:
+				out += "R"
+			case G > 0xC000:
+				out += "G"
+			case B > 0xC000:
+				out += "B"
+			default:
+				out += "?"
+			}
+		}
+		out += "/"
+	}
+	return out
+}
+
+// TestIntegrationHEIC decodes synthetic HEIC files with the managed FFmpeg.
+// The picture has red, green, blue, and white quadrants, so the colors show
+// how it was rotated or mirrored.
+func TestIntegrationHEIC(t *testing.T) {
+	managedTools(t)
+	cache := testCache(t)
+	hevc, err := os.ReadFile(testdata("image", "quadrants-64x48.hevc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exif := testimages.PhoneEXIF(binary.BigEndian, 6)
+	build := func(o testimages.HEIFOptions) []byte {
+		o.HEVC, o.Width, o.Height = hevc, 64, 48
+		return testimages.HEIF(o)
+	}
+	dir := t.TempDir()
+	cases := []struct {
+		name string
+		opts testimages.HEIFOptions
+		size string
+		want string
+	}{
+		// Stored: RG over BW.
+		{"plain", testimages.HEIFOptions{Mirror: -1}, "64x48", "RG/BW/"},
+		{"exif_only", testimages.HEIFOptions{Mirror: -1, EXIF: exif}, "64x48", "RG/BW/"},
+		{"phone", testimages.HEIFOptions{Rotation: 270, Mirror: -1, EXIF: exif}, "48x64", "BR/WG/"},
+		{"rot180", testimages.HEIFOptions{Rotation: 180, Mirror: -1}, "64x48", "WB/GR/"},
+		{"mirror0", testimages.HEIFOptions{Mirror: 0}, "64x48", "BW/RG/"},
+		{"mirror1", testimages.HEIFOptions{Mirror: 1}, "64x48", "GR/WB/"},
+		{"rot90_mirror0", testimages.HEIFOptions{Rotation: 90, Mirror: 0}, "48x64", "RB/GW/"},
+		{"mirror0_rot90", testimages.HEIFOptions{Rotation: 90, Mirror: 0, MirrorFirst: true}, "48x64", "WG/BR/"},
+		{"thumbnail_item", testimages.HEIFOptions{Thumbnail: true, Rotation: 90, Mirror: -1}, "48x64", "GW/RB/"},
+	}
+	for _, c := range cases {
+		in := filepath.Join(dir, c.name+".heic")
+		data := build(c.opts)
+		if err := os.WriteFile(in, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		r := runReal(t, cache, "thumb", in, "--size", "64x64", "--format", "png", "--output", filepath.Join(dir, "out"))
+		if r.err != nil {
+			t.Fatalf("%s: %v\n%s", c.name, r.err, r.stderr)
+		}
+		p := filepath.Join(dir, "out", c.name+"_thumb.png")
+		s := probeFirstStream(t, ffprobeFor(t), p)
+		if got := fmt.Sprintf("%dx%d", s.Width, s.Height); got != c.size {
+			t.Errorf("%s: %s, want %s", c.name, got, c.size)
+		}
+		if got := quadrants(t, p, 2, 2); got != c.want {
+			t.Errorf("%s: colors %s, want %s", c.name, got, c.want)
+		}
+		if after, _ := os.ReadFile(in); !bytes.Equal(after, data) {
+			t.Errorf("%s: the source changed", c.name)
+		}
+	}
+
+	// A phone-style tile grid: 2x1 tiles of 64x48, rotated 90 degrees
+	// clockwise, with EXIF orientation 6 that must not rotate it again.
+	grid := build(testimages.HEIFOptions{Grid: true, Rotation: 270, Mirror: -1, EXIF: exif})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write(grid) }))
+	defer srv.Close()
+	gdir := t.TempDir()
+	local := filepath.Join(gdir, "IMG grid.jpg") // HEIC content, JPEG name
+	if err := os.WriteFile(local, grid, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		args       []string
+		file, size string
+	}{
+		{[]string{"--size", "240x320"}, "IMG grid_thumb.jpg", "120x320"},
+		{[]string{"--size", "300x300", "--mode", "fill", "--format", "png"}, "IMG grid_thumb.png", "300x300"},
+	} {
+		r := runReal(t, cache, append([]string{"thumb", local, "--output", gdir}, c.args...)...)
+		if r.err != nil {
+			t.Fatalf("%v\n%s", r.err, r.stderr)
+		}
+		p := filepath.Join(gdir, c.file)
+		data, _ := os.ReadFile(p)
+		img, err := imaging.Decode(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b := img.Pixels.Bounds()
+		if got := fmt.Sprintf("%dx%d", b.Dx(), b.Dy()); got != c.size || img.EXIF != nil || bytes.Contains(data, []byte("Exif")) || bytes.Contains(data, []byte("iPhone")) {
+			t.Errorf("%s: %s, EXIF %v", c.file, got, img.EXIF)
+		}
+	}
+	// The fit thumbnail shows both tiles rotated: BR/WG twice, top to bottom.
+	if got := quadrants(t, filepath.Join(gdir, "IMG grid_thumb.jpg"), 2, 4); got != "BR/WG/BR/WG/" {
+		t.Errorf("grid colors %s", got)
+	}
+
+	// URL and list sources, with a failing line.
+	list := filepath.Join(gdir, "sources.txt")
+	content := "IMG grid.jpg\n" + srv.URL + "/p/remote.HEIC?sig=SECRET\n\nmissing.heic\n"
+	if err := os.WriteFile(list, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := runReal(t, cache, "thumb", "batch", list, "--size", "100x100", "--output", filepath.Join(gdir, "batch"))
+	if r.err == nil || r.err.Error() != "1 of 3 list lines failed" || !strings.Contains(r.stderr, "line 4: missing.heic: file does not exist") ||
+		strings.Contains(r.stdout+r.stderr, "SECRET") {
+		t.Errorf("batch: %v\n%s\n%s", r.err, r.stdout, r.stderr)
+	}
+	if got := quadrants(t, filepath.Join(gdir, "batch", "remote_thumb.jpg"), 2, 4); got != "BR/WG/BR/WG/" {
+		t.Errorf("remote grid colors %s", got)
+	}
+	r = runReal(t, cache, "inspect", "--json", srv.URL+"/p/remote.HEIC?sig=SECRET")
+	if r.err != nil || !strings.Contains(r.stdout, `"display_width": 48`) || !strings.Contains(r.stdout, `"name": "GPSLatitude"`) {
+		t.Errorf("inspect URL: %v\n%s", r.err, r.stdout)
+	}
+}
+
+func ffprobeFor(t *testing.T) string {
+	_, ffprobe := managedTools(t)
+	return ffprobe
 }
 
 // managedTools returns the managed ffmpeg and ffprobe from the test cache.

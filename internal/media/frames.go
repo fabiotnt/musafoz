@@ -187,17 +187,69 @@ func extractFrame(ctx context.Context, o FrameOptions, i int, t float64) error {
 // including the matching change to the sample aspect ratio.
 const squarePixels = "scale=w=round(iw*sar):h=ih,setsar=1"
 
-// ExtractCover writes a clean frame at source resolution in its displayed
-// orientation and aspect ratio, with square pixels.
-func ExtractCover(ctx context.Context, ffmpeg, input string, at float64, out string) error {
-	err := runFFmpeg(ctx, ffmpeg,
-		"-ss", seconds(at), "-i", ffmpegPath(input),
-		"-vf", squarePixels, "-frames:v", "1", "-update", "1", "-q:v", "2", out)
+// extractClean writes the clean frame shown at a time: source resolution,
+// displayed orientation and aspect ratio, square pixels, no overlay.
+// FFmpeg seeks before decoding, so the frame is the first one that starts
+// at or after the time. encode gives the output codec options. The seek and
+// the normalization are shared by covers and extracted images.
+func extractClean(ctx context.Context, ffmpeg, input string, at float64, out string, encode ...string) error {
+	args := []string{"-ss", seconds(at), "-i", ffmpegPath(input),
+		"-vf", squarePixels, "-frames:v", "1", "-update", "1"}
+	args = append(append(args, encode...), out)
+	err := runFFmpeg(ctx, ffmpeg, args...)
 	if err == nil {
 		err = checkNonEmpty(out)
 	}
-	if err != nil {
+	return err
+}
+
+// ExtractCover writes the clean frame at a time as a JPEG encoded by
+// FFmpeg with -q:v 2, as the reference workflow does. It is used by the
+// preview cover and musafoz cover.
+func ExtractCover(ctx context.Context, ffmpeg, input string, at float64, out string) error {
+	if err := extractClean(ctx, ffmpeg, input, at, out, "-q:v", "2"); err != nil {
 		return fmt.Errorf("cover at %s (%ss): %w", Timestamp(at), seconds(at), err)
+	}
+	return nil
+}
+
+// ExtractStill writes the clean frame at a time as a lossless 8-bit RGB
+// PNG, for musafoz image, which resizes and encodes it; see
+// stills.ExtractFrame.
+func ExtractStill(ctx context.Context, ffmpeg, input string, at float64, out string) error {
+	if err := extractClean(ctx, ffmpeg, input, at, out, "-pix_fmt", "rgb24", "-c:v", "png"); err != nil {
+		return fmt.Errorf("frame at %s (%ss): %w", Timestamp(at), seconds(at), err)
+	}
+	return nil
+}
+
+// DecodeImage decodes the primary image of a still image file, such as a
+// HEIC photo, into a PNG with 8-bit RGB, or RGBA when alpha is set.
+// FFmpeg picks the primary image itself: the tile grid of a HEIF file, not
+// its thumbnail or tiles. FFmpeg 9 applies the HEIF rotation and mirroring
+// while it builds the image; callers check the resulting size.
+func DecodeImage(ctx context.Context, ffmpeg, input, out string, alpha bool) error {
+	pix := "rgb24"
+	if alpha {
+		pix = "rgba"
+	}
+	err := runFFmpeg(ctx, ffmpeg, "-i", ffmpegPath(input),
+		"-frames:v", "1", "-update", "1", "-pix_fmt", pix, "-c:v", "png", out)
+	if err == nil {
+		err = checkNonEmpty(out)
+	}
+	return err
+}
+
+// CheckFrameTime checks that a time, in seconds, is between zero and the
+// start of the last video frame. A later time decodes nothing.
+func CheckFrameTime(at, last, duration float64) error {
+	if at < 0 || math.IsNaN(at) || math.IsInf(at, 0) {
+		return fmt.Errorf("time %v must be zero or more", at)
+	}
+	if at > last+1e-6 {
+		return fmt.Errorf("time %s is outside the video: the last frame starts at %s (duration %s); use a time from 00:00:00 to %s",
+			Timestamp(at), Timestamp(last), Timestamp(duration), Timestamp(math.Floor(last*1000)/1000))
 	}
 	return nil
 }

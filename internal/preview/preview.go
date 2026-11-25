@@ -268,8 +268,7 @@ func (r *run) do(ctx context.Context) (*Result, error) {
 	// One lock per output set, held until publishing and any restore end.
 	dir, base := splitInput(abs)
 	outputs := OutputsFor(abs)
-	lockPath := filepath.Join(dir, "."+base+".musafoz.lock")
-	unlock, err := fslock.Lock(ctx, lockPath, func() {
+	unlock, err := fslock.Lock(ctx, lockPath(dir, base), func() {
 		r.logf("waiting for another musafoz run that writes %s outputs", base)
 	})
 	if err != nil {
@@ -312,10 +311,10 @@ func (r *run) do(ctx context.Context) (*Result, error) {
 		}
 	}
 	last := info.LastFrameTime()
-	if c := o.CoverAt; c != nil && *c > last+1e-6 {
-		return nil, r.fail(StepValidateOptions, fmt.Errorf(
-			"cover time %s is outside the video: the last frame starts at %s (duration %s); use a time from 00:00:00 to %s",
-			media.Timestamp(*c), media.Timestamp(last), media.Timestamp(duration), media.Timestamp(math.Floor(last*1000)/1000)))
+	if c := o.CoverAt; c != nil {
+		if err := media.CheckFrameTime(*c, last, duration); err != nil {
+			return nil, r.fail(StepValidateOptions, fmt.Errorf("cover %w", err))
+		}
 	}
 	origStat, err := os.Stat(abs)
 	if err != nil {
