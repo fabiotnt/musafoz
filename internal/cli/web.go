@@ -28,7 +28,7 @@ func (f *webFlags) register(cmd *cobra.Command) {
 	d := stills.DefaultWebOptions()
 	fl := cmd.PersistentFlags()
 	fl.StringVar(&f.output, "output", "", "directory for the web copies (required); created when missing")
-	fl.StringVar(&f.metadata, "metadata", "", "directory for one <uuid>.json per content with all metadata, including GPS; keep it private")
+	fl.StringVar(&f.metadata, "metadata", "", "directory for the record <uuid>.json of each content, with all metadata including GPS; may be the --output directory; keep these files private")
 	fl.IntVar(&f.imageSize, "image-size", d.ImageMax, "maximum long side of web images, in pixels; images are never enlarged")
 	fl.IntVar(&f.thumbSize, "thumb-size", d.ThumbShort, "short side of thumbnails, in pixels; thumbnails keep the aspect ratio")
 	fl.IntVar(&f.quality, "quality", d.ImageQuality, "JPEG quality of web images, 1 to 100")
@@ -39,7 +39,7 @@ func (f *webFlags) register(cmd *cobra.Command) {
 	fl.IntVar(&f.frames, "frames", preview.DefaultFrames, fmt.Sprintf("frames of the video previews and mosaics, 1 to %d", preview.MaxFrames))
 	fl.BoolVar(&f.noPreview, "no-preview", false, "do not write covers, preview videos, and mosaics for videos")
 	fl.BoolVar(&f.overwrite, "overwrite", false, "replace existing outputs")
-	fl.BoolVar(&f.skipExisting, "skip-existing", false, "reuse the result of content whose metadata file and outputs exist, to resume a job; needs --metadata")
+	fl.BoolVar(&f.skipExisting, "skip-existing", false, "reuse finished content and finish content an interrupted run left, checking the recorded settings and the outputs in --output; needs --metadata")
 	cmd.MarkFlagsMutuallyExclusive("overwrite", "skip-existing")
 }
 
@@ -95,6 +95,7 @@ func (f *webFlags) options(env Env, root *rootOptions) (stills.Output, stills.We
 	}
 	if !f.noPreview {
 		frames := f.frames
+		o.PreviewFrames = frames
 		o.Preview = func(ctx context.Context, video string, overwrite bool) (string, string, string, error) {
 			res, err := preview.Run(ctx, preview.Options{
 				Input: video, Frames: frames, Overwrite: overwrite, Accel: media.AccelAuto,
@@ -143,8 +144,10 @@ func newWebCommand(env Env, root *rootOptions) *cobra.Command {
 			"given, the cover, preview video, and mosaic of the preview command are made\n" +
 			"from it: <uuid>_cover.jpg, <uuid>_preview.mp4, and <uuid>_preview.jpg.\n\n" +
 			"With --metadata, <uuid>.json keeps every metadata field read from the source,\n" +
-			"including EXIF, XMP, GPS, and the video container tags. Keep it private.\n" +
-			"The result is printed as JSON.",
+			"including EXIF, XMP, GPS, and the video container tags, with the settings and\n" +
+			"the SHA-256 of each output. It is written last and marks a finished content.\n" +
+			"It may go to the --output directory. Keep it private. The result is printed\n" +
+			"as JSON.",
 		Example: "  musafoz web IMG_0001.HEIC --output ./web --metadata ./meta\n" +
 			"  musafoz web clip.mov --output ./web --video-bitrate 4M\n" +
 			"  musafoz web batch sources.txt --output ./web --metadata ./meta --jsonl > report.jsonl",
@@ -181,8 +184,9 @@ func newWebCommand(env Env, root *rootOptions) *cobra.Command {
 			"lines continue, and the command exits with an error at the end.\n\n" +
 			"Without --jsonl the UUID and source of each line are printed. With --jsonl,\n" +
 			"stdout has one JSON object per line: line, source (a URL without credentials,\n" +
-			"query, or fragment), status (ok, duplicate, exists, or error), and the result\n" +
-			"or the error. The report has no GPS or camera data; --metadata files do.",
+			"query, or fragment), status (ok, resumed, duplicate, exists, or error), and the\n" +
+			"result or the error. The report has no GPS or camera data, but it names the\n" +
+			"sources: keep it private too.",
 		Example: "  musafoz web batch sources.txt --output ./web --metadata ./meta --jsonl > report.jsonl\n" +
 			"  musafoz web batch sources.txt --output ./web --metadata ./meta --skip-existing --jsonl",
 		Args: cobra.ExactArgs(1),

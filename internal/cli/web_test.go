@@ -54,7 +54,9 @@ func TestWebBatchJSONL(t *testing.T) {
 		[2][]byte{[]byte("iTXt"), testimages.PNGXMP(testimages.ScreenshotXMP("2024-09-27T08:37:55"))})
 	writeFile(t, filepath.Join(dir, "Screenshots", "shot.png"), shot)
 	list := writeFile(t, filepath.Join(dir, "list.txt"), []byte("General/phone.jpg\nmissing.heic\nFavorites/phone.jpg\nScreenshots/shot.png\n"))
-	out, meta := filepath.Join(dir, "web"), filepath.Join(dir, "meta")
+	// Media and records share one directory, as in the bucket.
+	out := filepath.Join(dir, "web")
+	meta := out
 	r := run(t, nil, "web", "batch", list, "--output", out, "--metadata", meta, "--jsonl")
 	if r.err == nil || r.err.Error() != "1 of 4 list lines failed" {
 		t.Errorf("err = %v", r.err)
@@ -86,8 +88,30 @@ func TestWebBatchJSONL(t *testing.T) {
 		t.Errorf("screenshot record %v", recs[3])
 	}
 	data, err := os.ReadFile(filepath.Join(meta, recs[0]["uuid"].(string)+".json"))
-	if err != nil || !strings.Contains(string(data), `"gps"`) || !strings.Contains(string(data), "General/phone.jpg") {
+	if err != nil || !strings.Contains(string(data), `"gps"`) || !strings.Contains(string(data), "General/phone.jpg") ||
+		!strings.Contains(string(data), `"xmp"`) && recs[0]["kind"] != "image" {
 		t.Errorf("metadata %v:\n%.300s", err, data)
+	}
+	shotMeta, _ := os.ReadFile(filepath.Join(meta, recs[3]["uuid"].(string)+".json"))
+	if !strings.Contains(string(shotMeta), `"photoshop:DateCreated": "2024-09-27T08:37:55"`) {
+		t.Errorf("screenshot record lost its XMP:\n%.400s", shotMeta)
+	}
+	// The media files carry no metadata.
+	entries, _ := os.ReadDir(out)
+	media := 0
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".jpg") {
+			media++
+			raw, _ := os.ReadFile(filepath.Join(out, e.Name()))
+			for _, leak := range []string{"Exif", "GPS", "iPhone", "xmpmeta", "ICC_PROFILE"} {
+				if strings.Contains(string(raw), leak) {
+					t.Errorf("%s contains %q", e.Name(), leak)
+				}
+			}
+		}
+	}
+	if media != 4 {
+		t.Errorf("%d media files", media)
 	}
 
 	// Running again with --skip-existing reuses every result.

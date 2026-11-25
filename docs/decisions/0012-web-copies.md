@@ -1,6 +1,7 @@
 # 0012 Web copies of a photo library
 
-Status: accepted
+Status: accepted; revised on 2026-11-25 for resumable runs and shared
+directories (see "Revision: resuming and privacy")
 Date: 2026-11-25
 
 ## Context
@@ -17,9 +18,11 @@ others in several folders.
 ### Command
 
 `web <source>` and `web batch <list>` write web copies into `--output`
-and, with `--metadata`, one JSON file per content into a separate,
-private directory. `--jsonl` gives a report line per list line, without
-GPS or camera data.
+and, with `--metadata`, one record per content, which may be in the same
+directory. `--jsonl` gives a report line per list line, without GPS or
+camera data. `web` is the import flow, with its own size contract;
+`thumb batch --size 480x480 --mode fill --quality 80 --jsonl` remains the
+way to make square thumbnails with a report.
 
 ### Names and duplicates
 
@@ -29,10 +32,9 @@ GPS or camera data.
 - Content seen earlier in a run is not converted again. Its later lines
   report status `duplicate` with the same UUID and files, so an importer
   can link one file to every folder that held it.
-- `--skip-existing` reads `<uuid>.json` and returns its recorded result,
-  status `exists`, when that file and every output listed in it exist. A
-  missing output makes the content a conflict again, so it is never
-  silently half done.
+- `--skip-existing` is described in the revision below. The first version
+  trusted the paths listed in the record, wherever they were, and treated
+  a content left half done as a conflict.
 
 ### Images
 
@@ -106,7 +108,93 @@ GPS or camera data.
 `<uuid>.json` holds the UUID, SHA-256, source as written, the result, and
 either the full image inspection (EXIF with GPS, XMP, color profile,
 sizes) or the full FFprobe JSON of a video. The report only has the
-result fields.
+result fields. With the revision below it is also the completion record.
+
+## Revision: resuming and privacy
+
+### Context
+
+Before the first production batch, a review asked for: batches that can be
+stopped at any point and run again safely, including after a video or an
+image was placed but before the other outputs; a check that the recorded
+outputs were made with the current settings and are in the output
+directory of the current run; and media and records of a UUID in one
+folder, as the site will keep them in a bucket with per-object access.
+
+### Decision
+
+- Each content is made in `.musafoz-staging/<uuid>-*/` inside the output
+  directory, on the same file system, so outputs are placed with a link or
+  rename. The preview of a video runs on the staged MP4 and writes beside
+  it, so its files are staged too.
+- The SHA-256 and size of every staged output go to a pending file,
+  `.<uuid>.musafoz-pending.json`, in the output directory. It holds no
+  metadata of the source. Then the outputs are placed, the record
+  `<uuid>.json` is written, and the pending file is removed. The record is
+  the last write, so it marks a finished content.
+- The record (format `musafoz-web-record/1`) stores the outputs by name,
+  with SHA-256 and size, and the settings that made them (WebConfig): the
+  pipeline version, image size and qualities for images; video size,
+  bitrate, CRF, audio bitrate, preview, and preview frames for videos.
+  Settings of the other kind are left out, so a change of image size does
+  not concern videos. WebPipeline is raised when musafoz changes its
+  outputs for the same settings.
+- With `--skip-existing`:
+  - a record whose settings differ is an error naming each change, such as
+    `image_quality 85 -> 70`. `--overwrite` makes the content again.
+  - a record whose outputs are all in the output directory of this run,
+    with the recorded SHA-256, is reused (`exists`). Outputs listed in the
+    record but found elsewhere do not count.
+  - otherwise the content is made again (`resumed`). A file at an output
+    name is replaced only when its SHA-256 is the one in the record or in
+    the pending file, that is, when musafoz wrote it, or when it already
+    has the new content. Any other file is a conflict and is kept.
+  - a pending file without a record means a run stopped while placing
+    outputs; the content is made again the same way.
+- Without `--skip-existing` or `--overwrite`, an existing record, a pending
+  file, or a file at an output name is an error, as before.
+- Two processes on the same output directory take an advisory lock for
+  the UUID (shared by UUIDs with the same first two hex digits, at most
+  256 lock files), so they never work on one content at once. Staging
+  directories of the UUID left by a dead run are removed under that lock.
+  Tasks on different machines claim the UUID at upload time; see
+  docs/web-pilot.md.
+- The UUID still names the original content. Reuse still reads the whole
+  original for its SHA-256 before anything else. `timings` in each result
+  separate that read (`hash`) from the conversion (`convert`) and from the
+  check of existing outputs (`verify`).
+- `--output` and `--metadata` may be the same directory. Media carry no
+  metadata. Records hold GPS, the full EXIF, XMP, and raw FFprobe tags. The
+  JSONL report has no GPS or camera data but maps original paths to UUIDs,
+  so it is internal. docs/web-pilot.md describes private-by-default
+  uploads, public read on an explicit list of media, records uploaded
+  last and private on every replacement, the bucket IAM check, and the
+  access checks.
+
+### Validation
+
+- stills: an interruption right after the first output is placed (a test
+  hook stops the content there) leaves the image, a pending file, and no
+  thumbnail or record; a plain rerun refuses it and names
+  `--skip-existing`; a run with it finishes the content (`resumed`) and
+  removes the pending file. Then: a finished content is reused without
+  writing (`exists`); a removed thumbnail is made again; a thumbnail
+  replaced by another file is kept and reported as a conflict; a change of
+  image quality is reported with the setting and its values, and
+  `--overwrite` remakes the content and records the new value; a change of
+  video bitrate does not concern an image; another output directory makes
+  the outputs there (`resumed`); a file of unknown origin at the name of a
+  new content is kept. All with `--output` and `--metadata` in one
+  directory.
+- cli: a batch with media and records in one directory; the records keep
+  GPS and XMP; the media have no EXIF, GPS, XMP, ICC, or device strings;
+  the report has no GPS or camera strings.
+- Integration with the real FFmpeg: the video batch in one directory; a
+  second run reuses every video after checking its four outputs; a change
+  of preview frames is reported as `preview_frames 9 -> 16`.
+- Linux pilot in Docker, with real phone files and a 4K HLG video: see
+  docs/web-pilot.md for the measurements, the kill and resume, and what
+  remains for the Cloud Run pilot.
 
 ## Validation
 

@@ -208,14 +208,16 @@ minutes. Video downloads are limited to 8 GiB and 60 minutes.
 ## Make web copies
 
 ```sh
-musafoz web IMG_0001.HEIC --output ./web --metadata ./meta
-musafoz web batch sources.txt --output ./web --metadata ./meta --jsonl > report.jsonl
-musafoz web batch sources.txt --output ./web --metadata ./meta --skip-existing --jsonl
+musafoz web IMG_0001.HEIC --output ./web --metadata ./web
+musafoz web batch sources.txt --output ./web --metadata ./web --jsonl > report.jsonl
+musafoz web batch sources.txt --output ./web --metadata ./web --skip-existing --jsonl >> report.jsonl
 ```
 
-`web` turns photos and videos into files every browser shows. The files
-are named by a UUID derived from the SHA-256 of the content, so the same
-content always gets the same name and a list converts it once.
+`web` is the import flow of a library: it turns photos and videos into
+files every browser shows, with their own size contract, and records what
+it read from each source. The files are named by a UUID derived from the
+SHA-256 of the original, so the same content always gets the same name and
+a list converts it once.
 
 | Source | Outputs |
 | --- | --- |
@@ -230,24 +232,65 @@ content always gets the same name and a list converts it once.
   the index at the start of the file. HDR video (HLG or PQ) is tone mapped
   to SDR. Container tags, including the recording place, are removed.
   `--no-preview` skips the cover, preview video, and mosaic.
-- `--metadata DIR` writes `<uuid>.json` with every field read from the
-  source: the full EXIF, XMP, color profile, and sizes of an image, or the
-  FFprobe output of a video with its container tags. It includes GPS
-  positions, so keep the directory private.
-- `--skip-existing` reuses the recorded result when the metadata file and
-  every output of a content already exist, so an interrupted job can run
-  again. Without it, existing outputs are conflicts unless `--overwrite`
-  is given.
+- `--metadata DIR` writes the record `<uuid>.json`: every field read from
+  the source (the full EXIF, XMP, color profile, and sizes of an image, or
+  the FFprobe output of a video with its container tags), the settings
+  that made the outputs, and the name and SHA-256 of each output. It may
+  be the `--output` directory. Records hold GPS positions: keep them
+  private.
+
+For square 480x480 thumbnails with a report, without the import outputs,
+use `musafoz thumb batch sources.txt --size 480x480 --mode fill --quality
+80 --jsonl`.
+
+### Interrupted runs
+
+Each content is made in `.musafoz-staging/` inside the output directory.
+Then a pending file, `.<uuid>.musafoz-pending.json`, records the name and
+SHA-256 of every output. The outputs are placed, and the record is written
+last. A record therefore means a finished content.
+
+`--skip-existing` makes a run safe to repeat after an interruption:
+
+| State found | Result |
+| --- | --- |
+| Record with the same settings, every output in `--output` with its recorded SHA-256 | Reused, status `exists`, nothing written |
+| Record, but an output missing or changed, or another `--output` directory | Made again, status `resumed` |
+| Pending file, no record (stopped while placing outputs) | Made again, status `resumed` |
+| Record made with other settings | Error naming the settings, such as `image_quality 85 -> 70`; `--overwrite` makes it again |
+| A file at an output name that no record or pending file vouches for | Conflict; the file is kept |
+
+When a content is finished, musafoz replaces only files whose SHA-256 is
+in the record or the pending file, or that already have the new content.
+Settings are compared per kind: a change of image size does not concern
+videos. The SHA-256 of the original is computed before anything else,
+because the UUID depends on it, so a reused content still costs one full
+read of its original. The `timings` of each result separate that read from
+the conversion and from the check of existing outputs.
+
+Without `--skip-existing` or `--overwrite`, an existing record, an
+unfinished content, or an existing output is an error, and nothing is
+replaced. Processes that share an output directory never work on the same
+UUID at once. Tasks on different machines need their own output
+directories and a claim per UUID at upload time; see
+[the pilot guide](docs/web-pilot.md).
+
+### Report
 
 With `--jsonl`, `web batch` writes one record per list line: `line`,
-`source`, `status` (`ok`, `duplicate` for content already converted in
-this run, `exists` with `--skip-existing`, or `error`), and the result:
-`kind`, `uuid`, `sha256`, `bytes`, `format`, `files`, the source and
-output sizes, `duration_seconds` for videos, `date` and `date_source`,
-`color_converted_from`, `hdr_tone_mapped`, `screenshot` when the XMP marks
-a screenshot, and `metadata`. Video dates come from the QuickTime
-creation date that phones write, with its UTC offset, or else from
-`creation_time` in UTC. The report has no GPS or camera data.
+`source`, `status` (`ok`, `resumed`, `duplicate` for content already
+converted in this run, `exists` with `--skip-existing`, or `error`), and
+the result: `kind`, `uuid`, `sha256`, `bytes`, `format`, `files`, the
+source and output sizes, `duration_seconds` for videos, `date` and
+`date_source`, `color_converted_from`, `hdr_tone_mapped`, `screenshot` when
+the XMP marks a screenshot, `metadata`, and `timings`. Video dates come
+from the QuickTime creation date that phones write, with its UTC offset,
+or else from `creation_time` in UTC.
+
+The report has no GPS or camera data, but it maps every original path to
+its UUID. Treat it as internal, like the records. Upload only the media
+files the site serves as public objects; see
+[the pilot guide](docs/web-pilot.md).
 
 ## Generate a video preview
 

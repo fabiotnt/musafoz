@@ -42,13 +42,25 @@ func TestIntegrationWebVideo(t *testing.T) {
 	if err := os.WriteFile(listPath, []byte(list.String()), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	out, meta := filepath.Join(dir, "web"), filepath.Join(dir, "meta")
+	// Media and records in one directory, as in the bucket.
+	out := filepath.Join(dir, "web")
+	meta := out
 	r := runReal(t, cache, "web", "batch", listPath, "--output", out, "--metadata", meta, "--frames", "9", "--jsonl")
 	if r.err != nil {
 		t.Fatalf("%v\n%s", r.err, r.stderr)
 	}
 	if strings.Contains(r.stdout, "ISO6709") || strings.Contains(r.stdout, "23.5505") {
 		t.Error("the report has the location")
+	}
+	// A second run reuses every video after checking its four outputs.
+	again := runReal(t, cache, "web", "batch", listPath, "--output", out, "--metadata", meta, "--frames", "9", "--skip-existing", "--jsonl")
+	if again.err != nil || strings.Count(again.stdout, `"status":"exists"`) != len(sources) {
+		t.Errorf("second run: %v\n%s", again.err, again.stdout)
+	}
+	// Other preview frames are other settings.
+	changed := runReal(t, cache, "web", "batch", listPath, "--output", out, "--metadata", meta, "--frames", "16", "--skip-existing", "--jsonl")
+	if changed.err == nil || !strings.Contains(changed.stderr, "preview_frames 9 -> 16") {
+		t.Errorf("changed frames: %v\n%s", changed.err, changed.stderr)
 	}
 	for i, line := range strings.Split(strings.TrimSpace(r.stdout), "\n") {
 		var rec struct {
