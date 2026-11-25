@@ -107,7 +107,17 @@ type FrameOptions struct {
 	// OnFrame, when set, is called after each frame is written. Calls may
 	// come from several goroutines at once.
 	OnFrame func()
+	// Last is the start of the last decodable frame (Info.LastFrameTime). A
+	// frame asked for in the last second before it that does not decode is
+	// taken a little earlier (see endRetries); zero disables this.
+	Last float64
 }
+
+// endRetries are the steps back, in seconds, tried for a frame near the end
+// that does not decode. Phone clips of a few seconds often end with frames
+// that a seek cannot reach, and 100 preview frames of a 3 second clip ask for
+// several of them.
+var endRetries = []float64{0.04, 0.1, 0.25, 0.5, 1}
 
 // ExtractFrames writes one JPEG per timestamp with an HH:MM:SS overlay. It
 // fails if any frame cannot be decoded, naming the first failing timestamp.
@@ -153,6 +163,28 @@ func ExtractFrames(ctx context.Context, o FrameOptions) error {
 }
 
 func extractFrame(ctx context.Context, o FrameOptions, i int, t float64) error {
+	err := extractFrameAt(ctx, o, i, t)
+	if err == nil || errors.Is(err, context.Canceled) || o.Last <= 0 || t < o.Last-1 {
+		return err
+	}
+	// Near the end only: the frame shown a little earlier. The overlay shows the
+	// time of the frame actually used. Frames elsewhere still fail, so a damaged
+	// file is reported.
+	for _, back := range endRetries {
+		if t-back < 0 {
+			break
+		}
+		if extractFrameAt(ctx, o, i, t-back) == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return context.Canceled
+		}
+	}
+	return err
+}
+
+func extractFrameAt(ctx context.Context, o FrameOptions, i int, t float64) error {
 	out := filepath.Join(o.WorkDir, fmt.Sprintf(FramePattern, i))
 	text := Clock(t)
 	escaped := text[0:2] + `\:` + text[3:5] + `\:` + text[6:8]

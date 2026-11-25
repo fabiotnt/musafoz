@@ -399,6 +399,7 @@ func (r *run) do(ctx context.Context) (*Result, error) {
 	frameOpts := media.FrameOptions{
 		FFmpeg: ffmpeg, Input: source, WorkDir: work, FontFile: fontCopy,
 		Times:       media.FrameTimes(duration, o.Frames, last),
+		Last:        last,
 		Overlay:     media.OverlayFor(info.Video.DisplayWidth, info.Video.DisplayAspect()),
 		Concurrency: o.Concurrency,
 	}
