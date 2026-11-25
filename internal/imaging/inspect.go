@@ -33,6 +33,11 @@ type Info struct {
 	// HEIF primary image. They define the displayed orientation; the EXIF
 	// orientation of a HEIF file is reported but not applied.
 	HEIFTransforms []HEIFTransform `json:"heif_transforms,omitempty"`
+	// ColorProfile names the embedded color profile, or the HEIF nclx
+	// description, when the file has one.
+	ColorProfile string `json:"color_profile,omitempty"`
+	// XMP holds the simple properties of the XMP packet (see ParseXMP).
+	XMP map[string]string `json:"xmp,omitempty"`
 	// EXIF holds every readable tag, or null when the file has none.
 	EXIF     *EXIF    `json:"exif"`
 	Warnings []string `json:"warnings,omitempty"`
@@ -50,20 +55,39 @@ func Inspect(path, name string) (*Info, error) {
 		return nil, err
 	}
 	if Sniff(data) == FormatHEIF {
-		return inspectHEIF(data, name, fi.Size())
+		h, err := ParseHEIF(data)
+		if err != nil {
+			return nil, err
+		}
+		info := HEIFInfo(h, nil, name, fi.Size())
+		if h.EXIF != nil {
+			if e, err := ParseEXIF(h.EXIF); err == nil {
+				info = HEIFInfo(h, e, name, fi.Size())
+			} else {
+				info.Warnings = append(info.Warnings, "EXIF block could not be read: "+err.Error())
+			}
+		}
+		return info, nil
 	}
 	img, err := Decode(data)
 	if err != nil {
 		return nil, err
 	}
+	return ImageInfo(img, name, fi.Size()), nil
+}
+
+// ImageInfo describes a decoded image. name is the path reported.
+func ImageInfo(img *Image, name string, size int64) *Info {
 	dw, dh := img.DisplaySize()
 	transparent := img.HasTransparentPixels()
 	info := &Info{
-		Path: name, Kind: "image", Format: img.Format, SizeBytes: fi.Size(),
+		Path: name, Kind: "image", Format: img.Format, SizeBytes: size,
 		Width: img.Width, Height: img.Height, DisplayWidth: dw, DisplayHeight: dh,
 		OrientationLabel:  OrientationLabel(img.Orientation),
 		AlphaChannel:      img.AlphaChannel,
 		TransparentPixels: &transparent,
+		ColorProfile:      profileName(img.ICC, nil),
+		XMP:               nonEmpty(img.XMP),
 		EXIF:              img.EXIF,
 	}
 	if img.Orientation != 0 {
@@ -73,36 +97,49 @@ func Inspect(path, name string) (*Info, error) {
 	if img.EXIFError != "" {
 		info.Warnings = append(info.Warnings, "EXIF block could not be read: "+img.EXIFError)
 	}
-	return info, nil
+	return info
 }
 
-// inspectHEIF reads a HEIF file from its container: the primary image
-// size and transforms, its alpha plane, and its EXIF block.
-func inspectHEIF(data []byte, name string, size int64) (*Info, error) {
-	h, err := ParseHEIF(data)
-	if err != nil {
-		return nil, err
-	}
+// HEIFInfo describes a HEIF file from its container, with e its parsed
+// EXIF block or nil. The pixels are not decoded, so TransparentPixels is
+// left out.
+func HEIFInfo(h *HEIF, e *EXIF, name string, size int64) *Info {
 	dw, dh := h.DisplaySize()
 	info := &Info{
 		Path: name, Kind: "image", Format: FormatHEIF, SizeBytes: size,
 		Width: h.Width, Height: h.Height, DisplayWidth: dw, DisplayHeight: dh,
 		AlphaChannel: h.Alpha, HEIFTransforms: h.Transforms,
 		OrientationLabel: OrientationLabel(0),
+		ColorProfile:     profileName(h.ICC, h.NCLX),
+		XMP:              nonEmpty(ParseXMP(h.XMP)),
+		EXIF:             e,
 	}
-	if h.EXIF != nil {
-		e, err := ParseEXIF(h.EXIF)
-		if err != nil {
-			info.Warnings = append(info.Warnings, "EXIF block could not be read: "+err.Error())
-		} else {
-			info.EXIF = e
-			if o := e.Orientation(); o != 0 {
-				info.Orientation = &o
-				info.OrientationLabel = OrientationLabel(o)
-			}
+	if o := e.Orientation(); e != nil && o != 0 {
+		info.Orientation = &o
+		info.OrientationLabel = OrientationLabel(o)
+	}
+	return info
+}
+
+func nonEmpty(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+// profileName names an ICC profile or an nclx description.
+func profileName(icc []byte, n *NCLX) string {
+	switch {
+	case icc != nil:
+		if cs, err := ParseICC(icc); err == nil {
+			return cs.Name
 		}
+		return "unsupported ICC profile"
+	case n != nil:
+		return fmt.Sprintf("nclx primaries %d, transfer %d", n.Primaries, n.Transfer)
 	}
-	return info, nil
+	return ""
 }
 
 // HEIFLabel describes HEIF transforms, such as "rotated 90 degrees

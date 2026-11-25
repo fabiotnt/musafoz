@@ -32,6 +32,8 @@ type Output struct {
 	Prefix, Suffix string
 	// Format is imaging.OutputJPEG or imaging.OutputPNG.
 	Format string
+	// Quality is the JPEG quality, 1 to 100; 0 means imaging.JPEGQuality.
+	Quality int
 	// Size, when set, resizes with Mode (imaging.ModeFit or ModeFill).
 	Size *imaging.Size
 	Mode string
@@ -61,6 +63,8 @@ type Runner struct {
 	ffmpeg   toolOnce
 	videos   map[string]*media.Info
 	dirReady map[string]bool
+	// web holds the web results of this run by SHA-256.
+	web map[string]*WebResult
 }
 
 type toolOnce struct {
@@ -256,13 +260,20 @@ func (r *Runner) claimIndexed(n int, name func(i, k int) (string, error), owner 
 // maxIndex bounds the indexes added to names of random frames.
 const maxIndex = 10000
 
-// writeImage renders img and places it at dst.
-func (r *Runner) writeImage(img image.Image, dst string) error {
+// writeImage resizes img with the output size and mode, converts it to
+// sRGB with cs when cs is not nil, encodes it, and places it at dst. The
+// color conversion runs after the resize, on fewer pixels; resizing in the
+// source space and converting after gives the same result within rounding.
+func (r *Runner) writeImage(img image.Image, dst string, cs *imaging.ColorSpace) error {
 	if err := r.ensureDir(filepath.Dir(dst)); err != nil {
 		return err
 	}
+	if r.Output.Size != nil {
+		img = imaging.Resize(img, *r.Output.Size, r.Output.Mode)
+	}
+	img = cs.ToSRGB(img)
 	return WriteFile(dst, r.Output.Overwrite, func(w io.Writer) error {
-		return imaging.Render(w, img, r.Output.Size, r.Output.Mode, r.Output.Format)
+		return imaging.Encode(w, img, r.Output.Format, r.Output.Quality)
 	})
 }
 
@@ -302,13 +313,21 @@ func WriteFile(dst string, overwrite bool, write func(io.Writer) error) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+	return PlaceFile(tmpName, dst, overwrite)
+}
+
+// PlaceFile moves a finished temporary file in the directory of dst to dst,
+// with the same rules as WriteFile: without overwrite an existing file is
+// a conflict, even one that appears meanwhile.
+func PlaceFile(tmpName, dst string, overwrite bool) error {
+	defer os.Remove(tmpName)
 	if err := os.Chmod(tmpName, 0o644); err != nil {
 		return err
 	}
 	if overwrite {
 		return os.Rename(tmpName, dst)
 	}
-	err = os.Link(tmpName, dst)
+	err := os.Link(tmpName, dst)
 	if errors.Is(err, fs.ErrExist) {
 		return &ConflictError{Paths: []string{dst}}
 	}
@@ -348,4 +367,13 @@ func ExtractFrame(ctx context.Context, ffmpeg, input string, at float64, workDir
 		return nil, fmt.Errorf("frame at %s: %w", media.Timestamp(at), err)
 	}
 	return img, nil
+}
+
+// size returns the size of the local file of a source, or 0.
+func (s *source) size() int64 {
+	fi, err := os.Stat(s.path)
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
 }

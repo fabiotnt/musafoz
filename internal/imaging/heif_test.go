@@ -30,19 +30,18 @@ func TestParseHEIF(t *testing.T) {
 		w, h       int
 		dw, dh     int
 		transforms string
-		correction int
 		exif       bool
 	}{
-		{"plain", testimages.HEIFOptions{Mirror: -1}, "hvc1", 64, 48, 64, 48, "none", 1, false},
-		{"EXIF orientation only", testimages.HEIFOptions{Mirror: -1, EXIF: exif}, "hvc1", 64, 48, 64, 48, "none", 1, true},
-		{"phone: irot 270 and EXIF 6", testimages.HEIFOptions{Rotation: 270, Mirror: -1, EXIF: exif}, "hvc1", 64, 48, 48, 64, "rotated 90 degrees clockwise", 1, true},
-		{"rotate 180", testimages.HEIFOptions{Rotation: 180, Mirror: -1}, "hvc1", 64, 48, 64, 48, "rotated 180 degrees clockwise", 1, false},
-		{"mirror axis 0", testimages.HEIFOptions{Mirror: 0}, "hvc1", 64, 48, 64, 48, "mirrored top to bottom", 1, false},
-		{"mirror axis 1", testimages.HEIFOptions{Mirror: 1}, "hvc1", 64, 48, 64, 48, "mirrored left to right", 1, false},
-		{"rotate then mirror", testimages.HEIFOptions{Rotation: 90, Mirror: 0}, "hvc1", 64, 48, 48, 64, "rotated 270 degrees clockwise, then mirrored top to bottom", 1, false},
-		{"mirror then rotate", testimages.HEIFOptions{Rotation: 90, Mirror: 0, MirrorFirst: true}, "hvc1", 64, 48, 48, 64, "mirrored top to bottom, then rotated 270 degrees clockwise", 3, false},
-		{"grid", testimages.HEIFOptions{Grid: true, Rotation: 270, Mirror: -1, EXIF: exif}, "grid", 128, 48, 48, 128, "rotated 90 degrees clockwise", 1, true},
-		{"thumbnail item", testimages.HEIFOptions{Thumbnail: true, Mirror: -1}, "hvc1", 64, 48, 64, 48, "none", 1, false},
+		{"plain", testimages.HEIFOptions{Mirror: -1}, "hvc1", 64, 48, 64, 48, "none", false},
+		{"EXIF orientation only", testimages.HEIFOptions{Mirror: -1, EXIF: exif}, "hvc1", 64, 48, 64, 48, "none", true},
+		{"phone: irot 270 and EXIF 6", testimages.HEIFOptions{Rotation: 270, Mirror: -1, EXIF: exif}, "hvc1", 64, 48, 48, 64, "rotated 90 degrees clockwise", true},
+		{"rotate 180", testimages.HEIFOptions{Rotation: 180, Mirror: -1}, "hvc1", 64, 48, 64, 48, "rotated 180 degrees clockwise", false},
+		{"mirror axis 0", testimages.HEIFOptions{Mirror: 0}, "hvc1", 64, 48, 64, 48, "mirrored top to bottom", false},
+		{"mirror axis 1", testimages.HEIFOptions{Mirror: 1}, "hvc1", 64, 48, 64, 48, "mirrored left to right", false},
+		{"rotate then mirror", testimages.HEIFOptions{Rotation: 90, Mirror: 0}, "hvc1", 64, 48, 48, 64, "rotated 270 degrees clockwise, then mirrored top to bottom", false},
+		{"mirror then rotate", testimages.HEIFOptions{Rotation: 90, Mirror: 0, MirrorFirst: true}, "hvc1", 64, 48, 48, 64, "mirrored top to bottom, then rotated 270 degrees clockwise", false},
+		{"grid", testimages.HEIFOptions{Grid: true, Rotation: 270, Mirror: -1, EXIF: exif}, "grid", 128, 48, 48, 128, "rotated 90 degrees clockwise", true},
+		{"thumbnail item", testimages.HEIFOptions{Thumbnail: true, Mirror: -1}, "hvc1", 64, 48, 64, 48, "none", false},
 	}
 	for _, c := range cases {
 		h, err := ParseHEIF(heicFixture(t, c.opts))
@@ -51,9 +50,9 @@ func TestParseHEIF(t *testing.T) {
 		}
 		dw, dh := h.DisplaySize()
 		if h.ItemType != c.typ || h.Width != c.w || h.Height != c.h || dw != c.dw || dh != c.dh ||
-			HEIFLabel(h.Transforms) != c.transforms || h.DecoderCorrection() != c.correction || (h.EXIF != nil) != c.exif {
-			t.Errorf("%s: %s %dx%d -> %dx%d %q correction %d exif %v", c.name, h.ItemType, h.Width, h.Height, dw, dh,
-				HEIFLabel(h.Transforms), h.DecoderCorrection(), h.EXIF != nil)
+			HEIFLabel(h.Transforms) != c.transforms || (h.EXIF != nil) != c.exif || (h.Grid != nil) != (c.typ == "grid") || h.Primary != 1 {
+			t.Errorf("%s: %s %dx%d -> %dx%d %q exif %v grid %v", c.name, h.ItemType, h.Width, h.Height, dw, dh,
+				HEIFLabel(h.Transforms), h.EXIF != nil, h.Grid)
 		}
 		if c.exif {
 			e, err := ParseEXIF(h.EXIF)
@@ -106,5 +105,20 @@ func TestInspectHEIC(t *testing.T) {
 	after, _ := os.ReadFile(p)
 	if !bytes.Equal(after, data) {
 		t.Error("inspect changed the file")
+	}
+}
+
+func TestParseHEIFColorAndXMP(t *testing.T) {
+	icc := testimages.ICC("Display P3", testimages.DisplayP3Colorants)
+	h, err := ParseHEIF(heicFixture(t, testimages.HEIFOptions{Grid: true, Mirror: -1, ICC: icc, NCLX: []int{12, 13, 6},
+		XMP: testimages.ScreenshotXMP("2024-09-27T08:37:55")}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(h.ICC) != string(icc) || h.NCLX == nil || h.NCLX.Primaries != 12 || h.NCLX.Transfer != 13 || !h.NCLX.FullRange {
+		t.Errorf("icc %d bytes, nclx %+v", len(h.ICC), h.NCLX)
+	}
+	if x := ParseXMP(h.XMP); x["photoshop:DateCreated"] != "2024-09-27T08:37:55" {
+		t.Errorf("xmp %v", x)
 	}
 }

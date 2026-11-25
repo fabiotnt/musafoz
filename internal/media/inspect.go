@@ -57,6 +57,11 @@ type Info struct {
 	// CodecTags lists each stream's codec tag in index order, for example
 	// "avc1" or "mebx". It is used to check remuxes and is not printed.
 	CodecTags []string `json:"-"`
+	// Tags are the container tags, such as creation_time and the QuickTime
+	// creation date and location. Raw is the whole FFprobe JSON. Neither is
+	// printed by inspect; web metadata files keep them.
+	Tags map[string]string `json:"-"`
+	Raw  json.RawMessage   `json:"-"`
 }
 
 // Duration sources.
@@ -93,6 +98,17 @@ type VideoStream struct {
 	DurationSeconds *float64 `json:"duration_seconds"`
 	// TimeBase is the stream time base, for example "1/60".
 	TimeBase string `json:"time_base,omitempty"`
+	// ColorTransfer, ColorPrimaries, and ColorSpace are the coded color
+	// description, such as "arib-std-b67", "bt2020", and "bt2020nc" for HLG
+	// HDR video. They are not printed by inspect.
+	ColorTransfer  string `json:"-"`
+	ColorPrimaries string `json:"-"`
+	ColorSpace     string `json:"-"`
+}
+
+// HDR reports a PQ (smpte2084) or HLG (arib-std-b67) transfer.
+func (v VideoStream) HDR() bool {
+	return v.ColorTransfer == "smpte2084" || v.ColorTransfer == "arib-std-b67"
 }
 
 // Timescale returns the denominator of a 1/N time base, or 0.
@@ -242,36 +258,40 @@ type probeOutput struct {
 }
 
 type probeFormat struct {
-	FormatName     string `json:"format_name"`
-	FormatLongName string `json:"format_long_name"`
-	Duration       string `json:"duration"`
-	Size           string `json:"size"`
-	BitRate        string `json:"bit_rate"`
+	Tags           map[string]string `json:"tags"`
+	FormatName     string            `json:"format_name"`
+	FormatLongName string            `json:"format_long_name"`
+	Duration       string            `json:"duration"`
+	Size           string            `json:"size"`
+	BitRate        string            `json:"bit_rate"`
 }
 
 type probeStream struct {
-	Index         int               `json:"index"`
-	CodecType     string            `json:"codec_type"`
-	CodecName     string            `json:"codec_name"`
-	CodecLongName string            `json:"codec_long_name"`
-	CodecTag      string            `json:"codec_tag_string"`
-	Profile       string            `json:"profile"`
-	Width         int               `json:"width"`
-	Height        int               `json:"height"`
-	PixFmt        string            `json:"pix_fmt"`
-	SampleAspect  string            `json:"sample_aspect_ratio"`
-	AvgFrameRate  string            `json:"avg_frame_rate"`
-	RFrameRate    string            `json:"r_frame_rate"`
-	TimeBase      string            `json:"time_base"`
-	Duration      string            `json:"duration"`
-	NbFrames      string            `json:"nb_frames"`
-	BitRate       string            `json:"bit_rate"`
-	SampleRate    string            `json:"sample_rate"`
-	Channels      int               `json:"channels"`
-	ChannelLayout string            `json:"channel_layout"`
-	Disposition   map[string]int    `json:"disposition"`
-	Tags          map[string]string `json:"tags"`
-	SideDataList  []struct {
+	Index          int               `json:"index"`
+	CodecType      string            `json:"codec_type"`
+	CodecName      string            `json:"codec_name"`
+	CodecLongName  string            `json:"codec_long_name"`
+	CodecTag       string            `json:"codec_tag_string"`
+	Profile        string            `json:"profile"`
+	Width          int               `json:"width"`
+	Height         int               `json:"height"`
+	PixFmt         string            `json:"pix_fmt"`
+	SampleAspect   string            `json:"sample_aspect_ratio"`
+	AvgFrameRate   string            `json:"avg_frame_rate"`
+	RFrameRate     string            `json:"r_frame_rate"`
+	TimeBase       string            `json:"time_base"`
+	Duration       string            `json:"duration"`
+	NbFrames       string            `json:"nb_frames"`
+	BitRate        string            `json:"bit_rate"`
+	SampleRate     string            `json:"sample_rate"`
+	Channels       int               `json:"channels"`
+	ChannelLayout  string            `json:"channel_layout"`
+	Disposition    map[string]int    `json:"disposition"`
+	Tags           map[string]string `json:"tags"`
+	ColorTransfer  string            `json:"color_transfer"`
+	ColorPrimaries string            `json:"color_primaries"`
+	ColorSpace     string            `json:"color_space"`
+	SideDataList   []struct {
 		SideDataType string   `json:"side_data_type"`
 		Rotation     *float64 `json:"rotation"`
 	} `json:"side_data_list"`
@@ -303,6 +323,8 @@ func ParseProbeJSON(data []byte) (*Info, error) {
 		Format:         p.Format.FormatName,
 		FormatLongName: p.Format.FormatLongName,
 		BitRate:        parseInt(p.Format.BitRate),
+		Tags:           p.Format.Tags,
+		Raw:            append(json.RawMessage(nil), data...),
 	}
 	if size := parseInt(p.Format.Size); size != nil {
 		info.SizeBytes = *size
@@ -359,6 +381,9 @@ func ParseProbeJSON(data []byte) (*Info, error) {
 		BitRate:         parseInt(video.BitRate),
 		DurationSeconds: parseDuration(video.Duration),
 		TimeBase:        video.TimeBase,
+		ColorTransfer:   video.ColorTransfer,
+		ColorPrimaries:  video.ColorPrimaries,
+		ColorSpace:      video.ColorSpace,
 	}
 	num, den := parseSAR(video.SampleAspect)
 	v.SampleAspectRatio = fmt.Sprintf("%d:%d", num, den)

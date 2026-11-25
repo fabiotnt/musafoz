@@ -96,6 +96,10 @@ func (e *BatchError) Error() string {
 type BatchHooks struct {
 	// OnOutput receives each written file.
 	OnOutput func(line int, path string)
+	// OnThumb receives each thumbnail of a thumbnail list, after OnOutput,
+	// with the source as printed in logs (a URL without credentials, query,
+	// or fragment).
+	OnThumb func(line int, source string, res *ThumbResult)
 	// OnError receives each failed line.
 	OnError func(*LineError)
 }
@@ -132,13 +136,16 @@ func (r *Runner) ThumbBatch(ctx context.Context, listPath string, h BatchHooks) 
 			fail(errors.New("the line has a TAB; thumbnail lists take one source per line"))
 			continue
 		}
-		out, err := r.Thumb(ctx, src, fmt.Sprintf("line %d", e.Line))
+		res, err := r.Thumb(ctx, src, fmt.Sprintf("line %d", e.Line))
 		if err != nil {
 			fail(err)
 			continue
 		}
 		if h.OnOutput != nil {
-			h.OnOutput(e.Line, out)
+			h.OnOutput(e.Line, res.Path)
+		}
+		if h.OnThumb != nil {
+			h.OnThumb(e.Line, label(e.Fields[0]), res)
 		}
 	}
 	if len(entries) == 0 {

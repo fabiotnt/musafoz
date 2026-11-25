@@ -27,6 +27,7 @@ go build -o musafoz ./cmd/musafoz
 | Generate only a cover | `musafoz cover clip.mp4 00:03:55` |
 | Extract a clean video frame | `musafoz image clip.mp4 00:01:00 --output ./frames` |
 | Resize a photo | `musafoz thumb photo.png --size 320x240` |
+| Make web copies of a library | `musafoz web batch sources.txt --output ./web --metadata ./meta --jsonl` |
 
 Use `musafoz <command> --help` to see the available flags. This README
 describes the current source tree. Check the release notes for the
@@ -76,16 +77,27 @@ the exact requested dimensions. Both modes can upscale the source.
 
 MusaFoz applies EXIF orientation before resizing. Thumbnails contain
 pixels only, so EXIF, GPS, camera data, and color profiles are omitted.
+Colors are converted to sRGB first when the image has an ICC profile with
+RGB colorants and tone curves, such as the Display P3 profile of phone
+photos, or a HEIF color description. Without this, wide gamut photos would
+look dull once their profile is gone. Profiles made only of lookup tables
+are kept as stored, and a message says so.
 
 HEIC photos, including from URLs and lists, are decoded with FFmpeg, which
-is resolved as for video commands. FFmpeg builds the primary image,
-including the tile grids that phones write, and applies the HEIF rotation
-and mirroring. MusaFoz checks the decoded size against the container and
-does not apply the EXIF orientation again, so photos are not rotated
-twice. An FFmpeg older than 7.1, or one without the HEVC decoder, fails
-with an error that names the limitation. The source file is not changed.
+is resolved as for video commands. FFmpeg decodes only the HEVC pictures.
+MusaFoz reads the rest of the container itself. It places the tiles of the
+grids that phones write, crops them to the exact size, including odd
+widths, adds an alpha plane when the photo has one, and applies the HEIF
+rotation and mirroring in the order the file lists them. The EXIF
+orientation of a HEIC file repeats that rotation and is not applied again,
+so photos are not rotated twice. An FFmpeg older than 7.1, or one without
+the HEVC decoder, fails with an error that names the limitation. The
+source file is not changed.
 JPEG is the default and uses a white background for transparent areas.
-Use `--format png` to keep transparency.
+Use `--format png` to keep transparency. JPEG thumbnails use quality 92.
+Pass `--quality N`, from 1 to 100, to trade detail for smaller files, as
+in `--quality 80`. The option is for `thumb` and `thumb batch` with JPEG
+output only.
 
 ## Extract video frames and covers
 
@@ -116,6 +128,7 @@ shorter clips. Pass `--overwrite` to replace an existing cover.
 | `--alongside` | Save beside a local source. Use it in place of `--output`. |
 | `--format png` | Write PNG. The default is JPEG. |
 | `--prefix TEXT` or `--suffix TEXT` | Customize the output name. Use one per run. |
+| `--quality N` | `thumb` only: JPEG quality from 1 to 100. The default is 92. |
 | `--overwrite` | Allow replacement of existing outputs. The original source remains protected. |
 
 `thumb` uses `_thumb` by default, as in `photo_thumb.jpg`. `image` includes
@@ -153,9 +166,88 @@ skipped. The command continues after a failed item, reports the line
 number and reason on stderr, and exits with an error if any item failed.
 Successfully written paths go to stdout.
 
+### Thumbnail report
+
+```sh
+musafoz thumb batch sources.txt --size 480x480 --mode fill --quality 80 \
+  --output ./thumbs --jsonl > report.jsonl
+```
+
+With `--jsonl`, `thumb batch` writes one JSON object per list line to
+stdout in place of the paths, in list order. Errors are still reported on
+stderr, and the command still exits with an error when any line failed.
+Each record has the list line number, the source, and the status:
+
+```json
+{"line":1,"source":"General/beach day.jpg","status":"ok","output":"/data/thumbs/beach day_thumb.jpg","source_width":3024,"source_height":4032,"output_width":480,"output_height":480,"date":"2025-01-19T10:15:32-03:00","date_source":"DateTimeOriginal"}
+{"line":2,"source":"https://example.com/images/logo.png","status":"error","error":"download https://example.com/images/logo.png: server answered 404 Not Found"}
+```
+
+- `source` is the line as written. URLs omit credentials, query
+  parameters, and fragments.
+- `source_width` and `source_height` are the displayed size of the
+  source, after its EXIF orientation or HEIF rotation.
+  `output_width` and `output_height` are the size of the thumbnail.
+- `date` comes from the EXIF `DateTimeOriginal`. When that tag is missing
+  or invalid, the XMP `exif:DateTimeOriginal`, `photoshop:DateCreated`, or
+  `xmp:CreateDate` is used, as in `"date_source":"XMP
+  photoshop:DateCreated"`. Phones keep the date of screenshots there.
+  Last comes the EXIF `DateTime`, the time the file was last changed,
+  often by an editing app. The fraction of a second and the UTC offset
+  are added when the file has them. A date without an offset has an
+  unknown time zone. It is not UTC. Both fields are `null` when the image
+  has no usable date.
+- The report reads the same file as the thumbnail, so a URL is downloaded
+  once. It has no GPS, camera, or other EXIF data. Use `inspect --json`
+  for the full metadata of one image.
+
 Direct HTTP(S) downloads are temporary. A repeated URL in a batch uses the
 same downloaded file. Image downloads are limited to 100 MiB and two
 minutes. Video downloads are limited to 8 GiB and 60 minutes.
+
+## Make web copies
+
+```sh
+musafoz web IMG_0001.HEIC --output ./web --metadata ./meta
+musafoz web batch sources.txt --output ./web --metadata ./meta --jsonl > report.jsonl
+musafoz web batch sources.txt --output ./web --metadata ./meta --skip-existing --jsonl
+```
+
+`web` turns photos and videos into files every browser shows. The files
+are named by a UUID derived from the SHA-256 of the content, so the same
+content always gets the same name and a list converts it once.
+
+| Source | Outputs |
+| --- | --- |
+| JPEG, PNG, GIF, WebP, BMP, TIFF, HEIC | `<uuid>.jpg` at most 2560 pixels on the long side, and `<uuid>_thumb.jpg` 480 pixels on the short side |
+| Video | `<uuid>.mp4`, plus `<uuid>_cover.jpg`, `<uuid>_preview.mp4`, and `<uuid>_preview.jpg` as made by `preview` |
+
+- Images are never enlarged. The orientation is applied, colors are
+  converted to sRGB, and the JPEGs carry no metadata. Quality is 85 for
+  images and 80 for thumbnails (`--quality`, `--thumb-quality`).
+- Videos become H.264 High and stereo AAC in MP4, at most 1080p in their
+  own orientation and 5 Mbps (`--video-size`, `--video-bitrate`), with
+  the index at the start of the file. HDR video (HLG or PQ) is tone mapped
+  to SDR. Container tags, including the recording place, are removed.
+  `--no-preview` skips the cover, preview video, and mosaic.
+- `--metadata DIR` writes `<uuid>.json` with every field read from the
+  source: the full EXIF, XMP, color profile, and sizes of an image, or the
+  FFprobe output of a video with its container tags. It includes GPS
+  positions, so keep the directory private.
+- `--skip-existing` reuses the recorded result when the metadata file and
+  every output of a content already exist, so an interrupted job can run
+  again. Without it, existing outputs are conflicts unless `--overwrite`
+  is given.
+
+With `--jsonl`, `web batch` writes one record per list line: `line`,
+`source`, `status` (`ok`, `duplicate` for content already converted in
+this run, `exists` with `--skip-existing`, or `error`), and the result:
+`kind`, `uuid`, `sha256`, `bytes`, `format`, `files`, the source and
+output sizes, `duration_seconds` for videos, `date` and `date_source`,
+`color_converted_from`, `hdr_tone_mapped`, `screenshot` when the XMP marks
+a screenshot, and `metadata`. Video dates come from the QuickTime
+creation date that phones write, with its UTC offset, or else from
+`creation_time` in UTC. The report has no GPS or camera data.
 
 ## Generate a video preview
 

@@ -223,22 +223,32 @@ func ExtractStill(ctx context.Context, ffmpeg, input string, at float64, out str
 	return nil
 }
 
-// DecodeImage decodes the primary image of a still image file, such as a
-// HEIC photo, into a PNG with 8-bit RGB, or RGBA when alpha is set.
-// FFmpeg picks the primary image itself: the tile grid of a HEIF file, not
-// its thumbnail or tiles. FFmpeg 9 applies the HEIF rotation and mirroring
-// while it builds the image; callers check the resulting size.
-func DecodeImage(ctx context.Context, ffmpeg, input, out string, alpha bool) error {
-	pix := "rgb24"
-	if alpha {
-		pix = "rgba"
+// DecodeItems decodes the HEIF items with the given ids, such as the tiles
+// of a grid, one PNG per item in dir, in a single FFmpeg run. Each item is
+// selected by its id as a stream (0:i:<id>) and decoded alone, without the
+// grid assembly, alpha merging, or rotation that FFmpeg does for the
+// primary image. gray writes 8-bit gray, for alpha planes; otherwise RGB.
+func DecodeItems(ctx context.Context, ffmpeg, input string, ids []uint64, dir string, gray bool) ([]string, error) {
+	pix, prefix := "rgb24", "item"
+	if gray {
+		pix, prefix = "gray", "alpha"
 	}
-	err := runFFmpeg(ctx, ffmpeg, "-i", ffmpegPath(input),
-		"-frames:v", "1", "-update", "1", "-pix_fmt", pix, "-c:v", "png", out)
-	if err == nil {
-		err = checkNonEmpty(out)
+	args := []string{"-noautorotate", "-i", ffmpegPath(input)}
+	outs := make([]string, len(ids))
+	for i, id := range ids {
+		outs[i] = filepath.Join(dir, fmt.Sprintf("%s-%d.png", prefix, id))
+		args = append(args, "-map", fmt.Sprintf("0:i:%d", id), "-frames:v", "1", "-update", "1",
+			"-pix_fmt", pix, "-c:v", "png", "-compression_level", "0", outs[i])
 	}
-	return err
+	if err := runFFmpeg(ctx, ffmpeg, args...); err != nil {
+		return nil, err
+	}
+	for _, o := range outs {
+		if err := checkNonEmpty(o); err != nil {
+			return nil, err
+		}
+	}
+	return outs, nil
 }
 
 // CheckFrameTime checks that a time, in seconds, is between zero and the

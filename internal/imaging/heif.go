@@ -12,6 +12,8 @@ import (
 // HEIF describes the primary image of a HEIF file (ISO/IEC 23008-12), as
 // read from its container boxes. Pixels are not decoded here.
 type HEIF struct {
+	// Primary is the item id of the primary image.
+	Primary uint64
 	// ItemType is the primary item type, such as "hvc1" or "grid".
 	ItemType string
 	// Width and Height come from the ispe property: the stored size, before
@@ -22,8 +24,20 @@ type HEIF struct {
 	Transforms []HEIFTransform
 	// Alpha reports an alpha auxiliary image linked to the primary item.
 	Alpha bool
+	// Grid is the layout of a grid primary item, or nil.
+	Grid *HEIFGrid
+	// AlphaItem is the item id of the alpha plane, or 0, and AlphaGrid its
+	// layout when the plane is itself a grid.
+	AlphaItem uint64
+	AlphaGrid *HEIFGrid
 	// EXIF is the TIFF-structured EXIF block of the primary item, or nil.
 	EXIF []byte
+	// XMP is the XMP packet that describes the primary item, or nil.
+	XMP []byte
+	// ICC is the color profile of the primary item (colr prof or rICC), or
+	// nil. NCLX is its coded color description (colr nclx), or nil.
+	ICC  []byte
+	NCLX *NCLX
 }
 
 // HEIFTransform is one irot or imir property. Rotation is in degrees
@@ -54,61 +68,63 @@ func (t HEIFTransform) orientation() int {
 	return 1
 }
 
-// DecoderCorrection returns the EXIF orientation value (see Orient) to
-// apply to an image that FFmpeg decoded from this file, so the result
-// follows the transforms in the order the file lists them. FFmpeg 9 applies
-// the rotation first and the mirroring second whatever their order, so the
-// result is 1 (nothing to do) unless the file mirrors before it rotates.
-func (h *HEIF) DecoderCorrection() int {
-	var rot, mir []HEIFTransform
+// HEIFGrid is the layout of a grid item: tiles of one size placed row by
+// row, and the top left part of that mosaic, Width x Height, is the image.
+type HEIFGrid struct {
+	Rows, Cols    int
+	Width, Height int
+	// Tiles are the item ids of the tiles, row by row.
+	Tiles []uint64
+}
+
+// Transform applies the rotation and mirroring of the primary item to img,
+// in the order the file lists them.
+func (h *HEIF) Transform(img image.Image) image.Image {
 	for _, t := range h.Transforms {
-		if t.Mirror != "" {
-			mir = append(mir, t)
-		} else {
-			rot = append(rot, t)
-		}
+		img = Orient(img, t.orientation())
 	}
-	return correction(append(rot, mir...), h.Transforms)
+	return img
 }
 
-// correction finds the orientation value that turns the result of the
-// applied transforms into the result of the wanted ones, by applying both
-// to a small image with distinct pixels.
-func correction(applied, wanted []HEIFTransform) int {
-	probe := image.NewNRGBA(image.Rect(0, 0, 3, 2))
-	for i := range 6 {
-		probe.Pix[i*4] = byte(i + 1)
-		probe.Pix[i*4+3] = 255
-	}
-	run := func(ts []HEIFTransform) image.Image {
-		var img image.Image = probe
-		for _, t := range ts {
-			img = Orient(img, t.orientation())
-		}
-		return img
-	}
-	got, want := run(applied), run(wanted)
-	for o := 1; o <= 8; o++ {
-		if samePixels(Orient(got, o), want) {
-			return o
-		}
-	}
-	return 1
+// isAlphaType reports whether an auxC type names an alpha plane: the
+// MPEG-B type urn:mpeg:mpegB:cicp:systems:auxiliary:alpha, or the HEVC
+// auxiliary id 1, urn:mpeg:hevc:2015:auxid:1, that phones write for
+// screenshots. Depth maps (auxid 2) and HDR gain maps are not alpha.
+func isAlphaType(s string) bool {
+	return strings.HasSuffix(s, ":alpha") || s == "urn:mpeg:hevc:2015:auxid:1"
 }
 
-func samePixels(a, b image.Image) bool {
-	if a.Bounds().Size() != b.Bounds().Size() {
-		return false
+// parseGrid reads the grid description of item id and its tiles (dimg
+// references, in order).
+func parseGrid(data []byte, children []box, loc location, refs []itemRef) (*HEIFGrid, error) {
+	b, err := itemData(data, children, loc)
+	if err != nil {
+		return nil, fmt.Errorf("HEIF container: grid description: %w", err)
 	}
-	ab, bb := a.Bounds(), b.Bounds()
-	for y := range ab.Dy() {
-		for x := range ab.Dx() {
-			if a.At(ab.Min.X+x, ab.Min.Y+y) != b.At(bb.Min.X+x, bb.Min.Y+y) {
-				return false
-			}
+	r := &reader{b: b}
+	r.n(1) // version
+	flags := r.n(1)
+	g := &HEIFGrid{Rows: int(r.n(1)) + 1, Cols: int(r.n(1)) + 1}
+	size := 2
+	if flags&1 != 0 {
+		size = 4
+	}
+	g.Width, g.Height = int(r.n(size)), int(r.n(size))
+	if r.err {
+		return nil, errors.New("HEIF container: truncated grid description")
+	}
+	for _, ref := range refs {
+		if ref.typ == "dimg" {
+			g.Tiles = append(g.Tiles, ref.to)
 		}
 	}
-	return true
+	if len(g.Tiles) != g.Rows*g.Cols {
+		return nil, fmt.Errorf("HEIF container: the %dx%d grid has %d tiles", g.Cols, g.Rows, len(g.Tiles))
+	}
+	if g.Width == 0 || g.Height == 0 {
+		return nil, errors.New("HEIF container: the grid has no size")
+	}
+	return g, nil
 }
 
 // DisplaySize returns the size after the transforms.
@@ -201,6 +217,16 @@ func (r *reader) str() string {
 
 type heifItem struct {
 	typ string
+	// contentType is set for mime items, such as application/rdf+xml.
+	contentType string
+}
+
+// NCLX is a colr box of type nclx: the color primaries, transfer
+// characteristics, and matrix coefficients as coded in ISO/IEC 23091-2
+// (the same numbers as in H.264 and HEVC).
+type NCLX struct {
+	Primaries, Transfer, Matrix int
+	FullRange                   bool
 }
 
 type extent struct {
@@ -263,7 +289,7 @@ func ParseHEIF(data []byte) (*HEIF, error) {
 	if !ok {
 		return nil, fmt.Errorf("HEIF container: primary item %d is not described", primary)
 	}
-	h := &HEIF{ItemType: it.typ}
+	h := &HEIF{Primary: primary, ItemType: it.typ}
 	gotSize := false
 	for _, idx := range assoc[primary] {
 		if idx == 0 || int(idx) > len(props) {
@@ -281,6 +307,22 @@ func ParseHEIF(data []byte) (*HEIF, error) {
 		case "irot":
 			if len(p.body) > 0 {
 				h.Transforms = append(h.Transforms, HEIFTransform{Rotation: int(p.body[0]&3) * 90})
+			}
+		case "colr":
+			if len(p.body) >= 4 {
+				switch string(p.body[:4]) {
+				case "prof", "rICC":
+					if len(p.body)-4 <= MaxMetaBytes {
+						h.ICC = p.body[4:]
+					}
+				case "nclx":
+					cr := &reader{b: p.body[4:]}
+					n := &NCLX{Primaries: int(cr.n(2)), Transfer: int(cr.n(2)), Matrix: int(cr.n(2))}
+					n.FullRange = cr.n(1)&0x80 != 0
+					if !cr.err {
+						h.NCLX = n
+					}
+				}
 			}
 		case "imir":
 			if len(p.body) > 0 {
@@ -317,17 +359,33 @@ func ParseHEIF(data []byte) (*HEIF, error) {
 				if block, err := itemData(data, children, locs[from]); err == nil {
 					h.EXIF = exifFromItem(block)
 				}
-			case l.typ == "auxl":
+			case l.typ == "cdsc" && items[from].typ == "mime" && items[from].contentType == "application/rdf+xml" && h.XMP == nil:
+				if block, err := itemData(data, children, locs[from]); err == nil && len(block) <= MaxMetaBytes {
+					h.XMP = block
+				}
+			case l.typ == "auxl" && h.AlphaItem == 0:
 				for _, idx := range assoc[from] {
 					if idx > 0 && int(idx) <= len(props) && props[idx-1].typ == "auxC" {
 						ar := &reader{b: props[idx-1].body}
 						ar.n(4)
-						if strings.Contains(ar.str(), "alpha") {
-							h.Alpha = true
+						if isAlphaType(ar.str()) {
+							h.Alpha, h.AlphaItem = true, from
 						}
 					}
 				}
 			}
+		}
+	}
+	if it.typ == "grid" {
+		if h.Grid, err = parseGrid(data, children, locs[primary], refs[primary]); err != nil {
+			return nil, err
+		}
+	}
+	if h.AlphaItem != 0 && items[h.AlphaItem].typ == "grid" {
+		// A damaged alpha grid only loses the transparency.
+		h.AlphaGrid, _ = parseGrid(data, children, locs[h.AlphaItem], refs[h.AlphaItem])
+		if h.AlphaGrid == nil {
+			h.Alpha, h.AlphaItem = false, 0
 		}
 	}
 	return h, nil
@@ -373,7 +431,12 @@ func parseIINF(children []box) (map[uint64]heifItem, error) {
 		if er.err {
 			return nil, errors.New("HEIF container: truncated infe box")
 		}
-		items[id] = heifItem{typ: typ}
+		it := heifItem{typ: typ}
+		if typ == "mime" {
+			er.str() // item name
+			it.contentType = er.str()
+		}
+		items[id] = it
 	}
 	_ = count
 	return items, nil

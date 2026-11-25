@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"image/color"
@@ -272,5 +273,113 @@ func TestInspectHEIC(t *testing.T) {
 	r = run(t, nil, "inspect", "--json", jpg)
 	if r.err != nil || !strings.Contains(r.stdout, `"transparent_pixels": false`) || strings.Contains(r.stdout, "heif_transforms") {
 		t.Errorf("jpeg JSON changed: %v\n%s", r.err, r.stdout)
+	}
+}
+
+// thumb batch --jsonl writes one record per list line, in order, downloads
+// each URL once for the thumbnail and its record, keeps going after a
+// failed line, and leaves the query, credentials, and EXIF details out.
+func TestThumbBatchJSONL(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Write(phoneJPEG())
+	}))
+	defer srv.Close()
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "General", "phone one.jpg"), phoneJPEG())
+	writeFile(t, filepath.Join(dir, "Screenshots", "screen.png"),
+		testimages.PNG(testimages.Halves(30, 60, color.NRGBA{255, 0, 0, 255}, color.NRGBA{0, 0, 255, 255}), nil))
+	writeFile(t, filepath.Join(dir, "notes.txt"), []byte("not an image"))
+	remote := strings.Replace(srv.URL, "http://", "http://user:pass@", 1) + "/remote/pic.jpg?sig=SECRET#frag"
+	list := writeFile(t, filepath.Join(dir, "list.txt"), []byte(
+		"General/phone one.jpg\n"+
+			"missing.jpg\n"+
+			"\n"+
+			remote+"\n"+
+			"notes.txt\n"+
+			"Screenshots/screen.png\n"))
+	out := filepath.Join(dir, "out")
+	r := run(t, nil, "thumb", "batch", list, "--size", "32x32", "--quality", "80", "--output", out, "--jsonl")
+	if r.err == nil || r.err.Error() != "2 of 5 list lines failed" {
+		t.Errorf("err = %v", r.err)
+	}
+	if hits.Load() != 1 {
+		t.Errorf("the URL was requested %d times", hits.Load())
+	}
+	for _, leak := range []string{"SECRET", "frag", "user", "pass", "GPS", "gps", "iPhone", "Apple", "exif"} {
+		if strings.Contains(r.stdout, leak) {
+			t.Errorf("report contains %q:\n%s", leak, r.stdout)
+		}
+	}
+	if !strings.Contains(r.stderr, "error: line 2: missing.jpg: file does not exist") ||
+		!strings.Contains(r.stderr, "error: line 5: notes.txt") {
+		t.Errorf("stderr:\n%s", r.stderr)
+	}
+	lines := strings.Split(strings.TrimSpace(r.stdout), "\n")
+	if len(lines) != 5 {
+		t.Fatalf("%d records:\n%s", len(lines), r.stdout)
+	}
+	want := []string{
+		`{"line":1,"source":"General/phone one.jpg","status":"ok","output":"` + filepath.Join(out, "phone one_thumb.jpg") +
+			`","source_width":32,"source_height":64,"output_width":16,"output_height":32,"date":"2026-10-31T17:51:24-03:00","date_source":"DateTimeOriginal"}`,
+		`{"line":2,"source":"missing.jpg","status":"error","error":"file does not exist"}`,
+		`{"line":4,"source":"` + srv.URL + `/remote/pic.jpg","status":"ok","output":"` + filepath.Join(out, "pic_thumb.jpg") +
+			`","source_width":32,"source_height":64,"output_width":16,"output_height":32,"date":"2026-10-31T17:51:24-03:00","date_source":"DateTimeOriginal"}`,
+		"",
+		`{"line":6,"source":"Screenshots/screen.png","status":"ok","output":"` + filepath.Join(out, "screen_thumb.jpg") +
+			`","source_width":30,"source_height":60,"output_width":16,"output_height":32,"date":null,"date_source":null}`,
+	}
+	for i, l := range lines {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(l), &rec); err != nil {
+			t.Errorf("record %d is not JSON: %v", i, err)
+		}
+		if i == 3 {
+			if rec["line"] != 5.0 || rec["status"] != "error" || !strings.Contains(rec["error"].(string), "not a supported image") {
+				t.Errorf("record 4: %s", l)
+			}
+			continue
+		}
+		if l != want[i] {
+			t.Errorf("record %d:\n got %s\nwant %s", i, l, want[i])
+		}
+	}
+
+	// Without --jsonl the output stays the list of written paths.
+	r = run(t, nil, "thumb", "batch", list, "--size", "32x32", "--output", filepath.Join(dir, "plain"))
+	if strings.Contains(r.stdout, "{") || len(strings.Split(strings.TrimSpace(r.stdout), "\n")) != 3 {
+		t.Errorf("plain stdout:\n%s", r.stdout)
+	}
+}
+
+// --quality is checked before the list is read or any output is written.
+func TestThumbQualityFlag(t *testing.T) {
+	dir := t.TempDir()
+	src := writeFile(t, filepath.Join(dir, "a.jpg"), phoneJPEG())
+	list := writeFile(t, filepath.Join(dir, "list.txt"), []byte("a.jpg\n"))
+	out := filepath.Join(dir, "out")
+	cases := map[string][]string{
+		"--quality: quality 0 is outside 1 to 100":   {"thumb", src, "--size", "8x8", "--quality", "0", "--output", out},
+		"--quality: quality 101 is outside 1 to 100": {"thumb", "batch", list, "--size", "8x8", "--quality", "101", "--output", out, "--jsonl"},
+		"--quality applies to JPEG output only":      {"thumb", "batch", list, "--size", "8x8", "--quality", "80", "--format", "png", "--output", out},
+		"invalid argument":                           {"thumb", src, "--size", "8x8", "--quality", "high"},
+	}
+	for want, args := range cases {
+		r := run(t, nil, args...)
+		if r.err == nil || !strings.Contains(r.err.Error(), want) || r.stdout != "" {
+			t.Errorf("%v: err = %v, stdout %q, want %q", args, r.err, r.stdout, want)
+		}
+	}
+	if _, err := os.Stat(out); err == nil {
+		t.Error("an output directory was created before the flags were checked")
+	}
+	r := run(t, nil, "thumb", src, "--size", "8x8", "--quality", "1", "--output", out)
+	if r.err != nil {
+		t.Errorf("quality 1: %v", r.err)
+	}
+	r = run(t, nil, "image", "clip.mp4", "--quality", "80")
+	if r.err == nil || !strings.Contains(r.err.Error(), "unknown flag: --quality") {
+		t.Errorf("image --quality: %v", r.err)
 	}
 }

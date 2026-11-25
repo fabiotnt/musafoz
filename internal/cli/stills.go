@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -18,6 +19,14 @@ import (
 type stillFlags struct {
 	size, mode, format, output, prefix, suffix string
 	alongside, overwrite                       bool
+	// quality is registered by thumb only (registerQuality).
+	quality int
+}
+
+// registerQuality adds --quality, for the commands that encode JPEG in Go.
+func (f *stillFlags) registerQuality(cmd *cobra.Command) {
+	cmd.PersistentFlags().IntVar(&f.quality, "quality", imaging.JPEGQuality,
+		fmt.Sprintf("JPEG quality, %d to %d; lower values give smaller files", imaging.MinQuality, imaging.MaxQuality))
 }
 
 func (f *stillFlags) register(cmd *cobra.Command, sizeHelp, suffixHelp string) {
@@ -61,6 +70,16 @@ func (f *stillFlags) toOutput(cmd *cobra.Command, sizeRequired bool, defaultSuff
 	if err != nil {
 		return o, fmt.Errorf("--format: %w", err)
 	}
+	if fl.Lookup("quality") != nil {
+		q, err := imaging.ParseQuality(f.quality)
+		if err != nil {
+			return o, fmt.Errorf("--quality: %w", err)
+		}
+		if fl.Changed("quality") && format != imaging.OutputJPEG {
+			return o, errors.New("--quality applies to JPEG output only")
+		}
+		o.Quality = q
+	}
 	if fl.Changed("output") && f.output == "" {
 		return o, errors.New("--output needs a directory")
 	}
@@ -102,6 +121,54 @@ func batchHooks(env Env) stills.BatchHooks {
 	}
 }
 
+// thumbRecordOK and thumbRecordFailed are the lines of the thumb batch
+// --jsonl report. They carry only what an import needs: no GPS, camera, or
+// other EXIF data. A written thumbnail always has date and date_source,
+// null when the picture has no date; source sizes are the displayed ones.
+type thumbRecordOK struct {
+	Line         int     `json:"line"`
+	Source       string  `json:"source"`
+	Status       string  `json:"status"`
+	Output       string  `json:"output"`
+	SourceWidth  int     `json:"source_width"`
+	SourceHeight int     `json:"source_height"`
+	OutputWidth  int     `json:"output_width"`
+	OutputHeight int     `json:"output_height"`
+	Date         *string `json:"date"`
+	DateSource   *string `json:"date_source"`
+}
+
+type thumbRecordFailed struct {
+	Line   int    `json:"line"`
+	Source string `json:"source"`
+	Status string `json:"status"`
+	Error  string `json:"error"`
+}
+
+// thumbReportHooks write the --jsonl report: one object per list line on
+// stdout, and errors on stderr as without --jsonl.
+func thumbReportHooks(env Env) stills.BatchHooks {
+	enc := json.NewEncoder(env.Stdout)
+	enc.SetEscapeHTML(false)
+	return stills.BatchHooks{
+		OnThumb: func(line int, source string, res *stills.ThumbResult) {
+			rec := thumbRecordOK{
+				Line: line, Source: source, Status: "ok", Output: res.Path,
+				SourceWidth: res.SourceWidth, SourceHeight: res.SourceHeight,
+				OutputWidth: res.Width, OutputHeight: res.Height,
+			}
+			if res.Date != nil {
+				rec.Date, rec.DateSource = &res.Date.Value, &res.Date.Source
+			}
+			enc.Encode(rec)
+		},
+		OnError: func(e *stills.LineError) {
+			fmt.Fprintf(env.Stderr, "error: %v\n", e)
+			enc.Encode(thumbRecordFailed{Line: e.Line, Source: e.Source, Status: "error", Error: e.Err.Error()})
+		},
+	}
+}
+
 func labelOf(src string) string {
 	if fetch.IsURL(src) {
 		return fetch.Redact(src)
@@ -123,10 +190,12 @@ func newThumbCommand(env Env, root *rootOptions) *cobra.Command {
 			"again.\n\n" +
 			"The output is <name>_thumb.jpg in the current directory, in --output, or\n" +
 			"beside the source with --alongside. For a URL, <name> is the last segment of\n" +
-			"its path. Existing files are kept unless --overwrite is given.",
+			"its path. Existing files are kept unless --overwrite is given. JPEG uses\n" +
+			"quality 92 unless --quality is given.",
 		Example: "  musafoz thumb photo.png --size 320x240\n" +
 			"  musafoz thumb photo.jpg --size 400x400 --mode fill --format png --output ./thumbs\n" +
 			"  musafoz thumb https://example.com/images/photo.jpg --size 320x240\n" +
+			"  musafoz thumb photo.jpg --size 480x480 --mode fill --quality 80\n" +
 			"  musafoz thumb batch sources.txt --size 320x240 --output ./thumbs",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -139,16 +208,18 @@ func newThumbCommand(env Env, root *rootOptions) *cobra.Command {
 				return err
 			}
 			defer done()
-			path, err := r.Thumb(cmd.Context(), args[0], "this run")
+			res, err := r.Thumb(cmd.Context(), args[0], "this run")
 			if err != nil {
 				return fmt.Errorf("thumb %s: %w", labelOf(args[0]), err)
 			}
-			fmt.Fprintln(env.Stdout, path)
+			fmt.Fprintln(env.Stdout, res.Path)
 			return nil
 		},
 	}
 	flags.register(cmd, "maximum size as WIDTHxHEIGHT, such as 320x240 (required)",
 		"text added after the base name instead of _thumb")
+	flags.registerQuality(cmd)
+	var jsonl bool
 	batch := &cobra.Command{
 		Use:   "batch <list.txt>",
 		Short: "Write thumbnails for the images listed in a text file",
@@ -156,9 +227,17 @@ func newThumbCommand(env Env, root *rootOptions) *cobra.Command {
 			"Empty lines are skipped and paths may contain spaces. Relative paths are\n" +
 			"resolved from the directory of the list. A failed line is reported with its\n" +
 			"number and reason, the other lines continue, and the command exits with an\n" +
-			"error at the end. The output paths are printed on stdout.",
-		Example: "  musafoz thumb batch sources.txt --size 320x240 --output ./thumbs",
-		Args:    cobra.ExactArgs(1),
+			"error at the end. The output paths are printed on stdout.\n\n" +
+			"With --jsonl, stdout has one JSON object per line of the list instead, in\n" +
+			"list order: the line number, the source (a URL without credentials, query,\n" +
+			"or fragment), and the status. A written thumbnail adds its path, the\n" +
+			"displayed size of the source, the size of the output, and the date of the\n" +
+			"picture with the EXIF tag it comes from: DateTimeOriginal, or DateTime as a\n" +
+			"fallback, with the UTC offset when the file gives one; null when the file\n" +
+			"has no date. A failed line adds the error. Errors also go to stderr.",
+		Example: "  musafoz thumb batch sources.txt --size 320x240 --output ./thumbs\n" +
+			"  musafoz thumb batch sources.txt --size 480x480 --mode fill --quality 80 --jsonl > report.jsonl",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			out, err := flags.toOutput(cmd, true, stills.DefaultThumbSuffix)
 			if err != nil {
@@ -169,9 +248,14 @@ func newThumbCommand(env Env, root *rootOptions) *cobra.Command {
 				return err
 			}
 			defer done()
-			return r.ThumbBatch(cmd.Context(), args[0], batchHooks(env))
+			hooks := batchHooks(env)
+			if jsonl {
+				hooks = thumbReportHooks(env)
+			}
+			return r.ThumbBatch(cmd.Context(), args[0], hooks)
 		},
 	}
+	batch.Flags().BoolVar(&jsonl, "jsonl", false, "print one JSON object per list line on stdout instead of the output paths")
 	cmd.AddCommand(batch)
 	return cmd
 }

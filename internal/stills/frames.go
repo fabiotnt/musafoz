@@ -154,7 +154,7 @@ func (r *Runner) Frames(ctx context.Context, raw string, req FrameRequest, owner
 		if err != nil {
 			return frames[:i], err
 		}
-		if err := r.writeImage(img, f.Path); err != nil {
+		if err := r.writeImage(img, f.Path, nil); err != nil {
 			return frames[:i], err
 		}
 	}

@@ -73,6 +73,14 @@ func decode(t *testing.T, p string) (*imaging.Image, []byte) {
 	return img, data
 }
 
+// thumbPath returns the output path of a Thumb call.
+func thumbPath(res *ThumbResult, err error) (string, error) {
+	if res == nil {
+		return "", err
+	}
+	return res.Path, err
+}
+
 func size(img *imaging.Image) string {
 	b := img.Pixels.Bounds()
 	return fmt.Sprintf("%dx%d", b.Dx(), b.Dy())
@@ -91,7 +99,7 @@ func TestThumbOrientsAndStripsMetadata(t *testing.T) {
 	for _, c := range cases {
 		out := filepath.Join(dir, "out-"+c.mode)
 		r := newRunner(t, Output{Dir: out, Suffix: DefaultThumbSuffix, Format: c.format, Mode: c.mode, Size: &imaging.Size{Width: 32, Height: 32}})
-		p, err := r.Thumb(context.Background(), src, "test")
+		p, err := thumbPath(r.Thumb(context.Background(), src, "test"))
 		must(t, err)
 		if want := filepath.Join(out, "phone photo_thumb"+imaging.Extension(c.format)); p != want {
 			t.Errorf("output %s, want %s", p, want)
@@ -125,7 +133,7 @@ func TestThumbTransparencyToJPEGIsWhite(t *testing.T) {
 	src := write(t, filepath.Join(dir, "logo.png"), testimages.PNG(img, nil))
 	for _, format := range []string{imaging.OutputJPEG, imaging.OutputPNG} {
 		r := newRunner(t, Output{Dir: dir, Suffix: "_" + format, Format: format, Size: &imaging.Size{Width: 20, Height: 20}})
-		p, err := r.Thumb(context.Background(), src, "test")
+		p, err := thumbPath(r.Thumb(context.Background(), src, "test"))
 		must(t, err)
 		out, _ := decode(t, p)
 		_, g, _, a := out.Pixels.At(15, 10).RGBA()
@@ -157,7 +165,7 @@ func TestThumbNamesAndConflicts(t *testing.T) {
 	}
 	for _, c := range cases {
 		c.out.Size = sz
-		p, err := newRunner(t, c.out).Thumb(context.Background(), src, "test")
+		p, err := thumbPath(newRunner(t, c.out).Thumb(context.Background(), src, "test"))
 		if err != nil || p != c.want {
 			t.Errorf("%+v: %s, %v; want %s", c.out, p, err, c.want)
 		}
@@ -211,7 +219,7 @@ func TestThumbURL(t *testing.T) {
 	defer srv.Close()
 	dir := t.TempDir()
 	r := newRunner(t, Output{Dir: dir, Suffix: DefaultThumbSuffix, Size: &imaging.Size{Width: 16, Height: 16}})
-	p, err := r.Thumb(context.Background(), srv.URL+"/photos/beach%20day.jpg?sig=SECRET", "test")
+	p, err := thumbPath(r.Thumb(context.Background(), srv.URL+"/photos/beach%20day.jpg?sig=SECRET", "test"))
 	must(t, err)
 	if p != filepath.Join(dir, "beach day_thumb.jpg") {
 		t.Errorf("output %s", p)
@@ -564,13 +572,20 @@ func TestThumbHEIC(t *testing.T) {
 	data := heic(t, testimages.HEIFOptions{Rotation: 270, Mirror: -1, EXIF: testimages.PhoneEXIF(binary.BigEndian, 6)})
 	// The content decides, not the extension.
 	src := write(t, filepath.Join(f.dir, "photo.jpg"), data)
+	// FFmpeg returns the stored 64x48 item; musafoz rotates it.
 	var buf bytes.Buffer
-	must(t, png.Encode(&buf, testimages.Halves(48, 64, red, blue)))
+	must(t, png.Encode(&buf, testimages.Halves(64, 48, red, blue)))
 	t.Setenv("FAKE_PNG", write(t, filepath.Join(f.dir, "decoded.png"), buf.Bytes()))
 	out := filepath.Join(f.dir, "out")
 	r := f.runner(t, Output{Dir: out, Suffix: DefaultThumbSuffix, Size: &imaging.Size{Width: 24, Height: 24}})
-	p, err := r.Thumb(context.Background(), src, "test")
+	res, err := r.Thumb(context.Background(), src, "test")
 	must(t, err)
+	p := res.Path
+	// The size and date come from the HEIF container and its EXIF item.
+	if res.SourceWidth != 48 || res.SourceHeight != 64 || res.Width != 18 || res.Height != 24 ||
+		res.Date == nil || res.Date.Value != "2026-10-31T17:51:24-03:00" || res.Date.Source != "DateTimeOriginal" {
+		t.Errorf("result %+v, date %+v", res, res.Date)
+	}
 	img, raw := decode(t, p)
 	if size(img) != "18x24" || img.EXIF != nil || bytes.Contains(raw, []byte("Exif")) || bytes.Contains(raw, []byte("iPhone")) {
 		t.Errorf("thumbnail %s, EXIF %v", size(img), img.EXIF)
@@ -579,17 +594,93 @@ func TestThumbHEIC(t *testing.T) {
 		t.Error("the source changed")
 	}
 
-	// A decoder that returns the stored size, as one that ignores the
-	// container rotation would, is reported instead of written.
+	// A decoder that returns another size, as one that rotates the item
+	// itself would, is reported instead of written.
 	buf.Reset()
-	must(t, png.Encode(&buf, testimages.Halves(64, 48, red, blue)))
+	must(t, png.Encode(&buf, testimages.Halves(48, 64, red, blue)))
 	t.Setenv("FAKE_PNG", write(t, filepath.Join(f.dir, "decoded.png"), buf.Bytes()))
 	r = f.runner(t, Output{Dir: out, Suffix: "_b", Size: &imaging.Size{Width: 24, Height: 24}})
 	_, err = r.Thumb(context.Background(), src, "test")
-	if err == nil || !strings.Contains(err.Error(), "FFmpeg decoded a 64x48 image, but the primary HEIC image is 48x64") {
+	if err == nil || !strings.Contains(err.Error(), "FFmpeg decoded a 48x64 image, but the HEIC item is 64x48") {
 		t.Errorf("err = %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(out, "photo_b.jpg")); err == nil {
 		t.Error("a thumbnail was written after the size check failed")
+	}
+}
+
+// Thumb reports the displayed size of the source, the size of the output,
+// and the date, from the same read that gives the pixels.
+func TestThumbResult(t *testing.T) {
+	dir := t.TempDir()
+	b := testimages.New(binary.BigEndian)
+	b.IFD0 = []testimages.Entry{b.ASCII(0x0132, "2025:01:19 10:15:32")}
+	edited := testimages.JPEG(testimages.Halves(40, 20, red, blue), b.Build())
+	cases := []struct {
+		name string
+		data []byte
+		mode string
+		want string
+		date *imaging.Date
+	}{
+		{"phone.jpg", phoneJPEG(), imaging.ModeFit, "32x64 16x32", &imaging.Date{Value: "2026-10-31T17:51:24-03:00", Source: "DateTimeOriginal"}},
+		{"edited.jpg", edited, imaging.ModeFill, "40x20 32x32", &imaging.Date{Value: "2025-01-19T10:15:32", Source: "DateTime"}},
+		{"screen.png", testimages.PNG(testimages.Halves(30, 60, red, blue), nil), imaging.ModeFit, "30x60 16x32", nil},
+	}
+	for _, c := range cases {
+		src := write(t, filepath.Join(dir, "in", c.name), c.data)
+		r := newRunner(t, Output{Dir: filepath.Join(dir, "out"), Suffix: DefaultThumbSuffix, Mode: c.mode, Size: &imaging.Size{Width: 32, Height: 32}})
+		res, err := r.Thumb(context.Background(), src, "test")
+		must(t, err)
+		got := fmt.Sprintf("%dx%d %dx%d", res.SourceWidth, res.SourceHeight, res.Width, res.Height)
+		if got != c.want {
+			t.Errorf("%s: sizes %s, want %s", c.name, got, c.want)
+		}
+		img, _ := decode(t, res.Path)
+		if size(img) != fmt.Sprintf("%dx%d", res.Width, res.Height) {
+			t.Errorf("%s: reported %dx%d, wrote %s", c.name, res.Width, res.Height, size(img))
+		}
+		switch {
+		case c.date == nil && res.Date != nil:
+			t.Errorf("%s: date %+v, want none", c.name, res.Date)
+		case c.date != nil && (res.Date == nil || *res.Date != *c.date):
+			t.Errorf("%s: date %+v, want %+v", c.name, res.Date, c.date)
+		}
+	}
+}
+
+// --quality changes the JPEG encoding only: orientation, stripped
+// metadata, and overwrite protection stay the same.
+func TestThumbQuality(t *testing.T) {
+	dir := t.TempDir()
+	img := image.NewNRGBA(image.Rect(0, 0, 128, 64))
+	for y := range 64 {
+		for x := range 128 {
+			img.Set(x, y, color.NRGBA{uint8(x * 2), uint8(y * 4), uint8(x ^ y), 255})
+		}
+	}
+	src := write(t, filepath.Join(dir, "noisy.jpg"), testimages.JPEG(img, testimages.PhoneEXIF(binary.BigEndian, 6)))
+	sizes := map[int]int64{}
+	for _, q := range []int{20, 95} {
+		out := filepath.Join(dir, fmt.Sprint(q))
+		r := newRunner(t, Output{Dir: out, Suffix: DefaultThumbSuffix, Quality: q, Size: &imaging.Size{Width: 64, Height: 64}})
+		p, err := thumbPath(r.Thumb(context.Background(), src, "test"))
+		must(t, err)
+		fi, err := os.Stat(p)
+		must(t, err)
+		sizes[q] = fi.Size()
+		dec, raw := decode(t, p)
+		if size(dec) != "32x64" || dec.EXIF != nil || bytes.Contains(raw, []byte("Exif")) || bytes.Contains(raw, []byte("iPhone")) {
+			t.Errorf("quality %d: %s, EXIF %v", q, size(dec), dec.EXIF)
+		}
+		// Protected without Overwrite, whatever the quality.
+		r = newRunner(t, Output{Dir: out, Suffix: DefaultThumbSuffix, Quality: 50, Size: &imaging.Size{Width: 64, Height: 64}})
+		var ce *ConflictError
+		if _, err := r.Thumb(context.Background(), src, "test"); !errors.As(err, &ce) {
+			t.Errorf("quality %d: second run err = %v", q, err)
+		}
+	}
+	if sizes[20] >= sizes[95] {
+		t.Errorf("quality 20 wrote %d bytes, quality 95 %d", sizes[20], sizes[95])
 	}
 }

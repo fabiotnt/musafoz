@@ -45,6 +45,12 @@ type Image struct {
 	// EXIFError tells why an EXIF block present in the file could not be
 	// read.
 	EXIFError string
+	// XMP holds the simple properties of the XMP packet (see ParseXMP),
+	// empty when the file has none.
+	XMP map[string]string
+	// ICC is the embedded color profile, or nil. Pixels are as stored, in
+	// that profile; see ToSRGB.
+	ICC []byte
 }
 
 // Load reads and decodes an image file and applies its EXIF orientation to
@@ -89,6 +95,8 @@ func Decode(data []byte) (*Image, error) {
 			img.Orientation = e.Orientation()
 		}
 	}
+	xmp, icc := findXMPICC(format, data)
+	img.XMP, img.ICC = ParseXMP(xmp), icc
 	img.Pixels = Orient(pix, img.Orientation)
 	return img, nil
 }
@@ -304,18 +312,35 @@ func Extension(format string) string {
 	return ".jpg"
 }
 
-// JPEGQuality is the quality of JPEG outputs.
-const JPEGQuality = 92
+// JPEGQuality is the default quality of JPEG outputs. MinQuality and
+// MaxQuality bound the quality that can be chosen.
+const (
+	JPEGQuality = 92
+	MinQuality  = 1
+	MaxQuality  = 100
+)
+
+// ParseQuality checks a JPEG quality from 1 to 100.
+func ParseQuality(q int) (int, error) {
+	if q < MinQuality || q > MaxQuality {
+		return 0, fmt.Errorf("quality %d is outside %d to %d", q, MinQuality, MaxQuality)
+	}
+	return q, nil
+}
 
 // Encode writes img in the output format. JPEG has no transparency, so
-// transparent pixels are composited over white. The encoders write pixel
-// data only: no EXIF, GPS, or other metadata reaches the output.
-func Encode(w io.Writer, img image.Image, format string) error {
+// transparent pixels are composited over white. quality applies to JPEG
+// only; 0 means JPEGQuality. The encoders write pixel data only: no EXIF,
+// GPS, or other metadata reaches the output.
+func Encode(w io.Writer, img image.Image, format string, quality int) error {
 	if format == OutputPNG {
 		enc := png.Encoder{CompressionLevel: png.DefaultCompression}
 		return enc.Encode(w, img)
 	}
-	return jpeg.Encode(w, flatten(img), &jpeg.Options{Quality: JPEGQuality})
+	if quality == 0 {
+		quality = JPEGQuality
+	}
+	return jpeg.Encode(w, flatten(img), &jpeg.Options{Quality: quality})
 }
 
 // flatten composites img over white when it has transparent pixels.
@@ -330,12 +355,25 @@ func flatten(img image.Image) image.Image {
 	return out
 }
 
-// Render resizes img when size is set and encodes it. It is the shared
+// Render resizes img when size is set and encodes it with quality (see
+// Encode). It is the shared
 // step that writes every still image: thumbnails, extracted frames, and
 // covers.
-func Render(w io.Writer, img image.Image, size *Size, mode, format string) error {
+func Render(w io.Writer, img image.Image, size *Size, mode, format string, quality int) error {
 	if size != nil {
 		img = Resize(img, *size, mode)
 	}
-	return Encode(w, img, format)
+	return Encode(w, img, format, quality)
+}
+
+// RenderedSize returns the size Render writes for an image of srcW x srcH.
+func RenderedSize(srcW, srcH int, size *Size, mode string) (w, h int) {
+	switch {
+	case size == nil:
+		return srcW, srcH
+	case mode == ModeFill:
+		return size.Width, size.Height
+	default:
+		return FitSize(srcW, srcH, *size)
+	}
 }

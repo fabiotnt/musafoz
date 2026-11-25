@@ -29,6 +29,20 @@ type HEIFOptions struct {
 	// Thumbnail adds a second, smaller-looking hvc1 item that is not the
 	// primary item.
 	Thumbnail bool
+	// GridCrop makes the grid output this many pixels narrower than its
+	// two tiles, so the right edge of the second tile is not shown, as in
+	// phone files with an odd width.
+	GridCrop int
+	// Alpha adds an alpha plane (auxC urn:mpeg:hevc:2015:auxid:1) linked
+	// to the primary item: the same picture, or with Grid a grid of it.
+	Alpha bool
+	// ICC adds a colr property of type prof with this profile, and NCLX a
+	// colr property of type nclx with primaries, transfer, and matrix.
+	ICC  []byte
+	NCLX []int
+	// XMP adds an XMP packet as a mime item that describes the primary
+	// item.
+	XMP string
 }
 
 type bbuf struct{ bytes.Buffer }
@@ -139,7 +153,7 @@ func HEIF(o HEIFOptions) []byte {
 	items := []item{}
 	primaryW, primaryH := o.Width, o.Height
 	if o.Grid {
-		primaryW = 2 * o.Width
+		primaryW = 2*o.Width - o.GridCrop
 		var g bbuf
 		g.u8(0)         // version
 		g.u8(0)         // flags: 16-bit sizes
@@ -152,6 +166,23 @@ func HEIF(o HEIFOptions) []byte {
 		items = append(items, item{1, "hvc1", pic, false})
 	}
 	next := len(items) + 1
+	alphaID, alphaTiles := 0, []int{}
+	if o.Alpha {
+		alphaID = next
+		if o.Grid {
+			items = append(items, item{alphaID, "grid", items[0].data, true}, item{alphaID + 1, "hvc1", pic, false}, item{alphaID + 2, "hvc1", pic, false})
+			alphaTiles = []int{alphaID + 1, alphaID + 2}
+		} else {
+			items = append(items, item{alphaID, "hvc1", pic, false})
+		}
+		next = len(items) + 1
+	}
+	xmpID := 0
+	if o.XMP != "" {
+		xmpID = next
+		items = append(items, item{xmpID, "mime", []byte(o.XMP), false})
+		next = len(items) + 1
+	}
 	thumbID, exifID := 0, 0
 	if o.Thumbnail {
 		thumbID = next
@@ -173,6 +204,30 @@ func HEIF(o HEIFOptions) []byte {
 	if o.Grid {
 		props = append(props, ispe(primaryW, primaryH))
 		gridIspe = len(props)
+	}
+	auxC := 0
+	if o.Alpha {
+		var a bbuf
+		a.Write(full(0, 0))
+		a.str("urn:mpeg:hevc:2015:auxid:1")
+		a.u8(0)
+		props = append(props, mkbox("auxC", a.Bytes()))
+		auxC = len(props)
+	}
+	var colr []int
+	if o.ICC != nil {
+		props = append(props, mkbox("colr", []byte("prof"), o.ICC))
+		colr = append(colr, len(props))
+	}
+	if o.NCLX != nil {
+		var c bbuf
+		c.str("nclx")
+		c.u16(o.NCLX[0])
+		c.u16(o.NCLX[1])
+		c.u16(o.NCLX[2])
+		c.u8(0x80)
+		props = append(props, mkbox("colr", c.Bytes()))
+		colr = append(colr, len(props))
 	}
 	var transforms []int
 	addRot := func() {
@@ -203,14 +258,24 @@ func HEIF(o HEIFOptions) []byte {
 	ipma.Write(full(0, 0))
 	assoc := map[int][]int{}
 	if o.Grid {
-		assoc[1] = append([]int{gridIspe}, transforms...)
+		assoc[1] = append(append([]int{gridIspe}, colr...), transforms...)
 		assoc[2] = []int{1, 2}
 		assoc[3] = []int{1, 2}
 	} else {
-		assoc[1] = append([]int{1, 2}, transforms...)
+		assoc[1] = append(append([]int{1, 2}, colr...), transforms...)
 	}
 	if thumbID != 0 {
 		assoc[thumbID] = []int{1, 2}
+	}
+	if alphaID != 0 {
+		if o.Grid {
+			assoc[alphaID] = []int{gridIspe, auxC}
+			for _, id := range alphaTiles {
+				assoc[id] = []int{1, 2}
+			}
+		} else {
+			assoc[alphaID] = []int{1, 2, auxC}
+		}
 	}
 	ids := []int{}
 	for _, it := range items {
@@ -242,6 +307,10 @@ func HEIF(o HEIFOptions) []byte {
 		e.u16(0)
 		e.str(it.typ)
 		e.u8(0) // empty name
+		if it.typ == "mime" {
+			e.str("application/rdf+xml")
+			e.u8(0)
+		}
 		iinf.Write(mkbox("infe", e.Bytes()))
 	}
 
@@ -254,6 +323,28 @@ func HEIF(o HEIFOptions) []byte {
 		d.u16(2)
 		d.u16(3)
 		iref.Write(mkbox("dimg", d.Bytes()))
+	}
+	if alphaID != 0 {
+		if o.Grid {
+			var d bbuf
+			d.u16(alphaID)
+			d.u16(2)
+			d.u16(alphaTiles[0])
+			d.u16(alphaTiles[1])
+			iref.Write(mkbox("dimg", d.Bytes()))
+		}
+		var d bbuf
+		d.u16(alphaID)
+		d.u16(1)
+		d.u16(1)
+		iref.Write(mkbox("auxl", d.Bytes()))
+	}
+	if xmpID != 0 {
+		var d bbuf
+		d.u16(xmpID)
+		d.u16(1)
+		d.u16(1)
+		iref.Write(mkbox("cdsc", d.Bytes()))
 	}
 	if thumbID != 0 {
 		var d bbuf

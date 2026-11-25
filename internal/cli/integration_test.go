@@ -1002,6 +1002,62 @@ func TestIntegrationHEIC(t *testing.T) {
 		}
 	}
 
+	// Grids with an odd width, as phones write: the right column of the
+	// last tile is cropped, not the whole image rounded down. An alpha
+	// plane, alone or as a grid, gives transparency; its picture is the
+	// luma of the quadrants, so the red and blue corners are translucent.
+	odd := []struct {
+		name string
+		opts testimages.HEIFOptions
+		w, h int
+	}{
+		{"odd_grid", testimages.HEIFOptions{Grid: true, GridCrop: 1, Mirror: -1}, 127, 48},
+		{"odd_grid_rot", testimages.HEIFOptions{Grid: true, GridCrop: 1, Rotation: 270, Mirror: -1}, 48, 127},
+		{"alpha", testimages.HEIFOptions{Alpha: true, Mirror: -1}, 64, 48},
+		{"alpha_grid", testimages.HEIFOptions{Grid: true, GridCrop: 1, Alpha: true, Mirror: -1}, 127, 48},
+	}
+	var oddList strings.Builder
+	for _, c := range odd {
+		if err := os.WriteFile(filepath.Join(dir, c.name+".heic"), build(c.opts), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		oddList.WriteString(c.name + ".heic\n")
+	}
+	oddPath := filepath.Join(dir, "odd.txt")
+	if err := os.WriteFile(oddPath, []byte(oddList.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := runReal(t, cache, "thumb", "batch", oddPath, "--size", "256x256", "--format", "png", "--output", filepath.Join(dir, "odd"), "--jsonl")
+	if r.err != nil {
+		t.Fatalf("odd sizes: %v\n%s", r.err, r.stderr)
+	}
+	recs := strings.Split(strings.TrimSpace(r.stdout), "\n")
+	for i, c := range odd {
+		var rec struct {
+			SourceWidth  int    `json:"source_width"`
+			SourceHeight int    `json:"source_height"`
+			Output       string `json:"output"`
+		}
+		if i >= len(recs) || json.Unmarshal([]byte(recs[i]), &rec) != nil {
+			t.Fatalf("%s: record %q", c.name, recs)
+		}
+		if rec.SourceWidth != c.w || rec.SourceHeight != c.h {
+			t.Errorf("%s: source %dx%d, want %dx%d", c.name, rec.SourceWidth, rec.SourceHeight, c.w, c.h)
+		}
+		data, _ := os.ReadFile(rec.Output)
+		img, err := imaging.Decode(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := img.HasTransparentPixels(); got != c.opts.Alpha {
+			t.Errorf("%s: transparent %v", c.name, got)
+		}
+		// The top left (red) corner is the first tile, right side up.
+		if rr, gg, bb, _ := img.Pixels.At(4, 4).RGBA(); c.name == "odd_grid" && (rr>>8 < 200 || gg>>8 > 60 || bb>>8 > 60) {
+			t.Errorf("%s: top left %v", c.name, img.Pixels.At(4, 4))
+		}
+	}
+
 	// A phone-style tile grid: 2x1 tiles of 64x48, rotated 90 degrees
 	// clockwise, with EXIF orientation 6 that must not rotate it again.
 	grid := build(testimages.HEIFOptions{Grid: true, Rotation: 270, Mirror: -1, EXIF: exif})
@@ -1045,7 +1101,7 @@ func TestIntegrationHEIC(t *testing.T) {
 	if err := os.WriteFile(list, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	r := runReal(t, cache, "thumb", "batch", list, "--size", "100x100", "--output", filepath.Join(gdir, "batch"))
+	r = runReal(t, cache, "thumb", "batch", list, "--size", "100x100", "--output", filepath.Join(gdir, "batch"))
 	if r.err == nil || r.err.Error() != "1 of 3 list lines failed" || !strings.Contains(r.stderr, "line 4: missing.heic: file does not exist") ||
 		strings.Contains(r.stdout+r.stderr, "SECRET") {
 		t.Errorf("batch: %v\n%s\n%s", r.err, r.stdout, r.stderr)

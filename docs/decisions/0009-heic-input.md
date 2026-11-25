@@ -1,7 +1,9 @@
 # 0009 HEIC input for inspect and thumb
 
 Status: accepted; Linux verified in a container, Windows and native Linux
-pending
+pending. The decoding part is superseded by 0011: FFmpeg now decodes each
+HEVC item alone, and musafoz assembles grids, applies alpha planes, and
+applies irot and imir itself.
 Date: 2026-11-25
 
 ## Context

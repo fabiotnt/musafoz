@@ -288,7 +288,7 @@ func TestEncodeTransparency(t *testing.T) {
 	img := image.NewNRGBA(image.Rect(0, 0, 8, 8))
 	img.Set(0, 0, color.NRGBA{255, 0, 0, 255})
 	var buf bytes.Buffer
-	if err := Encode(&buf, img, OutputJPEG); err != nil {
+	if err := Encode(&buf, img, OutputJPEG, 0); err != nil {
 		t.Fatal(err)
 	}
 	out, err := jpeg.Decode(&buf)
@@ -299,7 +299,7 @@ func TestEncodeTransparency(t *testing.T) {
 		t.Errorf("transparent pixel became %v in JPEG, want white", out.At(6, 6))
 	}
 	buf.Reset()
-	if err := Encode(&buf, img, OutputPNG); err != nil {
+	if err := Encode(&buf, img, OutputPNG, 0); err != nil {
 		t.Fatal(err)
 	}
 	p, err := png.Decode(&buf)
@@ -319,7 +319,7 @@ func TestRenderWritesNoMetadata(t *testing.T) {
 	}
 	for _, format := range []string{OutputJPEG, OutputPNG} {
 		var buf bytes.Buffer
-		if err := Render(&buf, img.Pixels, &Size{16, 16}, ModeFit, format); err != nil {
+		if err := Render(&buf, img.Pixels, &Size{16, 16}, ModeFit, format, 0); err != nil {
 			t.Fatal(err)
 		}
 		data := buf.Bytes()
